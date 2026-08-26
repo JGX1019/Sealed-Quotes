@@ -1,0 +1,8 @@
+{
+  "version": 3,
+  "file": "index.js",
+  "sourceRoot": "../../../",
+  "sources": ["contracts/sealedquote.compact"],
+  "names": [],
+  "mappings": ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;EAyCA;;;;;;;;;;MAgBA,AAAA,QAIC;;;;;cAJuB,QAAgB;;;;;;;;;;;;;;;;;;yCAAhB,QAAgB;;;;;;;qEAAhB,QAAgB;;;OAIvC;MAUD,AAAA,UAOC;;;;;cAPyB,OAAe;;;;;;;;;;;;;;;;;;yCAAf,OAAe;;;;;;;uEAAf,OAAe;;;OAOxC;MAKD,AAAA,SAGC;;;;;;;;;;;;;;;;;;;;;;OAAA;;;;;;;;;;;;GACA;EA9CD;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;IAKA;;;;;;;;;yEAAmC;IACnC;;;;;;;;;yEAAiC;IACjC;;;;;;;;;yEAAwC;IACxC;;;;;;;;;yEAA+B;;;;;;;GAsC9B;EA9BD,AAAA,WAIC,4BAJuB,QAAgB;4BAC/B,QAAM;IACb;;;;;;;2HAAsB,QAAM;;yEAAlB;IACV;;;;;;;;;yEAAO;;GACR;EAUD,AAAA,aAOC,4BAPyB,OAAe;oDAChC;;;;;;;;;;;yHAAO;;4BACP,OAAK;UAEN,WAAgD,GAA3B,OAAK;;gDAAI;;;;;;;;;;;qHAAU;;;;UAC9C,KAAS;IAAT;;;;;;;;;;6FAAA,KAAS;;;;wEAAA;UACT,KAAgB,GAAa,WAAS;IAAtC;;;;;;;;;;6FAAA,KAAgB;;;;wEAAA;;GACjB;EAKD,AAAA,YAGC;oDAFQ;;;;;;;;;;;yHAAO;;IACd;;;;;;;;;yEAAO;;GACR;;;;;;;;;;;;;;;;IAxCD;qCAAA;;;;;;;;;;;0GAAmC;KAAA;IACnC;qCAAA;;;;;;;;;;;0GAAiC;KAAA;IACjC;qCAAA;;;;;;;;;;;0GAAwC;KAAA;IACxC;qCAAA;;;;;;;;;;;0GAA+B;KAAA;;;;;;;;;;"
+}
