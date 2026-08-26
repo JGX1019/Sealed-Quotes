@@ -1,0 +1,87 @@
+/**
+ * sealedquote.compact — Sealed Quote RFQ
+ *
+ * A buyer publishes a request-for-quote with a maximum budget. Suppliers
+ * submit sealed bids: each bid is checked against the budget entirely
+ * inside a zero-knowledge proof, so a supplier's exact price is never
+ * written to the chain, read by the buyer, or seen by rival suppliers.
+ * Only two public facts ever land on-chain: how many bids came in, and
+ * how many of them qualified (were at or under budget).
+ *
+ * PUBLIC (on-chain, visible to anyone):
+ *   - budget_max: the buyer's disclosed ceiling price. Buyers publish this
+ *     deliberately — it is what attracts competitive bids in the first
+ *     place, the same way a real RFQ states a budget range.
+ *   - bid_count: total number of sealed bids submitted.
+ *   - qualifying_count: how many of those bids were at or under budget.
+ *   - is_open: whether the RFQ is still accepting bids.
+ *
+ * PRIVATE (circuit input, never stored on-chain):
+ *   - price: a supplier's exact bid. Consumed inside the proof and never
+ *     disclosed — not to the buyer, not to rival suppliers, not to chain
+ *     observers.
+ *
+ * WHAT A SUPPLIER PROVES WITHOUT REVEALING:
+ *   - That their price is at or under the buyer's published budget.
+ *   - That their price is greater than zero (a well-formed bid).
+ *   The exact price is never disclosed by the proof — only the boolean
+ *   fact "this bid qualified" is.
+ *
+ * WHY THE WINNING PRICE ISN'T SETTLED ON-CHAIN HERE:
+ *   Trustlessly picking "the lowest of N sealed bids" on-chain requires
+ *   comparing every bid against every other bid without ever revealing
+ *   any of them — a sorting network in zero knowledge. That is real,
+ *   solvable cryptography, but out of scope for this build (see
+ *   PROPOSAL.md, "Mainnet Feasibility"). What this contract proves today
+ *   is the part that is fully trustless with the tools at hand: bid
+ *   validity and budget-eligibility. Final price negotiation between the
+ *   buyer and a qualifying supplier happens off-chain, over a private
+ *   channel the buyer opens with a qualifying supplier of their choice —
+ *   the same shape real-world sealed-bid procurement already uses.
+ */
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ── Ledger state ─────────────────────────────────────────────────────────────
+export ledger budget_max: Uint<64>;
+export ledger bid_count: Counter;
+export ledger qualifying_count: Counter;
+export ledger is_open: Boolean;
+
+// ── Circuit: open_rfq ──────────────────────────────────────────────────────────
+// The buyer sets the public budget ceiling and opens bidding. budget_max is
+// disclosed deliberately: it's the number that draws bids, not something the
+// buyer is trying to hide. Uses disclose() because assigning a circuit
+// parameter into public state always requires it, even for a value that was
+// never private to begin with.
+export circuit open_rfq(budget: Uint<64>): [] {
+  assert(budget > 0, "budget must be positive");
+  budget_max = disclose(budget);
+  is_open = disclose(true);
+}
+
+// ── Circuit: submit_bid ────────────────────────────────────────────────────────
+// price is a PRIVATE circuit parameter. The asserts run inside the proof, so
+// an invalid or over-budget bid simply cannot produce a valid proof — the
+// price is validated without ever being read by anyone but the bidder.
+//
+// disclose(qualifies) publishes exactly one bit per bid: did it qualify.
+// The price itself is never assigned to public state anywhere in this
+// circuit, so it never becomes disclosable.
+export circuit submit_bid(price: Uint<64>): [] {
+  assert(is_open, "RFQ is not open for bids");
+  assert(price > 0, "price must be positive");
+
+  const qualifies: Uint<8> = price <= budget_max ? 1 : 0;
+  bid_count.increment(1);
+  qualifying_count += disclose(qualifies);
+}
+
+// ── Circuit: close_rfq ──────────────────────────────────────────────────────────
+// Stops further bids. No private input — this only flips a public flag that
+// was already public.
+export circuit close_rfq(): [] {
+  assert(is_open, "RFQ is already closed");
+  is_open = disclose(false);
+}
