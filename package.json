@@ -1,6 +1,7 @@
 {
   "name": "sealedquote",
   "version": "1.0.0",
+  "license": "Apache-2.0",
   "description": "SealedQuote — a private RFQ marketplace on Midnight. Suppliers submit sealed bids proven against a public budget without revealing price.",
   "type": "module",
   "scripts": {

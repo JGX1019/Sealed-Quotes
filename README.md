@@ -1,6 +1,6 @@
 # SealedQuote
 
-![CI](https://github.com/JGX1019/SealedQuote/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/JGX1019/Sealed-Quotes/actions/workflows/ci.yml/badge.svg)
 
 > A private RFQ marketplace on Midnight — sealed bids, publicly verifiable qualification, no revealed price.
 
@@ -57,8 +57,8 @@ This is aimed at B2B procurement, where sealed bidding is the norm but rarely ac
 ## Setup & Run Locally
 
 ```bash
-git clone https://github.com/JGX1019/SealedQuote.git
-cd SealedQuote
+git clone https://github.com/JGX1019/Sealed-Quotes.git
+cd Sealed-Quotes
 npm install --legacy-peer-deps
 
 # Compile the contract (outputs to managed/)
@@ -131,3 +131,7 @@ PROPOSAL.md                       — product proposal
 ## Note on deployment path
 
 The contract is deployed **from the frontend** through a connected wallet, not via a Node.js CLI script. A CLI path builds its own wallet and syncs it directly against the public indexer, which proved unreliable against Preprod during earlier builds in this series — the wallet-sdk's sync stream has no internal retry and can stall indefinitely on a transient indexer hiccup. Going through the wallet sidesteps this, since the wallet extension owns its own sync.
+
+## License
+
+Licensed under the [Apache License 2.0](./LICENSE).
