@@ -156,7 +156,7 @@ body {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   border: 1px solid var(--border);
   background: var(--surface);
   margin: 1.25rem 1.25rem 0;
@@ -358,6 +358,12 @@ body {
   margin: 0;
   font-size: 0.75rem;
   color: var(--text);
+}
+
+/* The meta list now carries more than one row (contract address, private state
+   status), so separate the groups. */
+.meta dt:not(:first-of-type) {
+  margin-top: 0.6rem;
 }
 
 /* ── Rating picker ───────────────────────────────────────── */
@@ -568,6 +574,24 @@ body {
 }
 
 /* ── Mobile ──────────────────────────────────────────────── */
+
+/* Four tallies side by side get cramped before they get narrow enough to
+   stack, so drop to a 2x2 grid first. Declared before the 40rem rule so the
+   single-column layout still wins on genuinely small screens. */
+@media (max-width: 56rem) {
+  .stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* In a 2x2 grid the 2nd and 4th cells are flush against the outer border. */
+  .stat:nth-child(2n) {
+    border-right: none;
+  }
+
+  .stat:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--border);
+  }
+}
 
 @media (max-width: 40rem) {
   .stats {

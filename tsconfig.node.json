@@ -3,7 +3,10 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022"],
+    // DOM is included so the test suite can typecheck and exercise
+    // src/api/browserPrivateStateProvider.ts, which is browser code (localStorage)
+    // but is unit-tested here against a localStorage stub.
+    "lib": ["ES2022", "DOM"],
     "types": ["jest", "node"],
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
@@ -15,6 +18,14 @@
     "sourceMap": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/network.ts", "src/wallet.ts", "src/deploy.ts", "tests", "vite.config.ts"],
+  "include": [
+    "src/network.ts",
+    "src/wallet.ts",
+    "src/deploy.ts",
+    "src/api/privateState.ts",
+    "src/api/browserPrivateStateProvider.ts",
+    "tests",
+    "vite.config.ts"
+  ],
   "exclude": ["node_modules", "dist", "managed"]
 }

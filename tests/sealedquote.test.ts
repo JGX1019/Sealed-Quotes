@@ -4,8 +4,12 @@
  * Tests cover:
  *  1. Circuit logic     — open/close lifecycle, bid validity, budget checks
  *  2. State transitions — counts accumulate correctly across many bids
- *  3. Privacy model      — the private `price` never appears in ledger state,
- *                          and different qualifying/non-qualifying prices are
+ *  3. Private state     — the supplier's own previous bid is remembered
+ *                          locally via witnesses, and drives the revision
+ *                          circuit
+ *  4. Privacy model     — the private `price` and the remembered previous bid
+ *                          never appear in ledger state, and different
+ *                          qualifying/non-qualifying prices are
  *                          indistinguishable on the public ledger
  */
 
@@ -15,13 +19,25 @@ import {
   emptyZswapLocalState,
 } from '@midnight-ntwrk/compact-runtime';
 import { Contract, ledger } from '../managed/sealedquote/contract/index.js';
+import { emptyPrivateState, witnesses } from '../src/api/privateState.js';
 
 const DUMMY_ADDRESS = '0'.repeat(64);
 const DUMMY_KEY = '0'.repeat(64);
 
+/** The five fields the public ledger is expected to expose — and only these. */
+const PUBLIC_LEDGER_FIELDS = [
+  'bid_count',
+  'budget_max',
+  'is_open',
+  'qualifying_count',
+  'revision_count',
+];
+
 function freshState() {
-  const contract = new Contract({});
-  const ctx = createConstructorContext({}, DUMMY_ADDRESS);
+  // The contract is constructed with the real witness implementations, so these
+  // tests exercise the same private-state code path the dApp uses.
+  const contract = new Contract(witnesses as any);
+  const ctx = createConstructorContext(emptyPrivateState, DUMMY_ADDRESS);
   const init = contract.initialState(ctx);
   return { contract, contractState: init.currentContractState, privateState: init.currentPrivateState };
 }
@@ -39,6 +55,12 @@ function callOpen(contract: Contract<any>, contractState: any, privateState: any
 function callBid(contract: Contract<any>, contractState: any, privateState: any, price: bigint) {
   const ctx = createCircuitContext(DUMMY_ADDRESS, emptyZswapLocalState(DUMMY_KEY), contractState, privateState);
   const result = contract.circuits.submit_bid(ctx, price);
+  return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
+}
+
+function callRevised(contract: Contract<any>, contractState: any, privateState: any, price: bigint) {
+  const ctx = createCircuitContext(DUMMY_ADDRESS, emptyZswapLocalState(DUMMY_KEY), contractState, privateState);
+  const result = contract.circuits.submit_revised_bid(ctx, price);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
 
@@ -70,6 +92,7 @@ describe('Sealed Quote RFQ Contract', () => {
       expect(state.is_open).toBe(false);
       expect(state.bid_count).toBe(0n);
       expect(state.qualifying_count).toBe(0n);
+      expect(state.revision_count).toBe(0n);
     });
 
     it('open_rfq publishes the budget and opens bidding', () => {
@@ -164,12 +187,107 @@ describe('Sealed Quote RFQ Contract', () => {
     });
   });
 
+  describe('Private state — the supplier remembers their own previous bid', () => {
+    it('a fresh supplier has no remembered bid', () => {
+      const { privateState } = freshState();
+      expect(privateState.lastBid).toBe(0n);
+    });
+
+    it('submit_bid records the price in the supplier\'s private state', () => {
+      const { priv } = openAndBid(1000n, [640n]);
+      expect(priv.lastBid).toBe(640n);
+    });
+
+    it('private state tracks the most recent bid across several bids', () => {
+      const { priv } = openAndBid(1000n, [900n, 800n, 700n]);
+      expect(priv.lastBid).toBe(700n);
+    });
+
+    it('rejects a revision when the supplier has never bid', () => {
+      // No prior submit_bid, so local_last_bid() returns 0 and the
+      // "no earlier bid" assert must fail.
+      const { contract, state, priv } = openAndBid(1000n, []);
+      expect(() => callRevised(contract, state, priv, 500n)).toThrow();
+    });
+
+    it('accepts a revision that strictly undercuts the previous bid', () => {
+      const { contract, state, priv } = openAndBid(1000n, [900n]);
+      const revised = callRevised(contract, state, priv, 850n);
+      const s = readLedger(revised.chargedState);
+      expect(s.revision_count).toBe(1n);
+      expect(s.bid_count).toBe(2n);
+      expect(revised.privateState.lastBid).toBe(850n);
+    });
+
+    it('rejects a revision equal to the previous bid', () => {
+      const { contract, state, priv } = openAndBid(1000n, [900n]);
+      expect(() => callRevised(contract, state, priv, 900n)).toThrow();
+    });
+
+    it('rejects a revision higher than the previous bid', () => {
+      const { contract, state, priv } = openAndBid(1000n, [900n]);
+      expect(() => callRevised(contract, state, priv, 950n)).toThrow();
+    });
+
+    it('rejects a zero-price revision', () => {
+      const { contract, state, priv } = openAndBid(1000n, [900n]);
+      expect(() => callRevised(contract, state, priv, 0n)).toThrow();
+    });
+
+    it('rejects a revision after the RFQ is closed', () => {
+      const { contract, state, priv } = openAndBid(1000n, [900n]);
+      const closed = callClose(contract, state, priv);
+      expect(() => callRevised(contract, closed.chargedState, closed.privateState, 800n)).toThrow();
+    });
+
+    it('supports a chain of successively lower revisions', () => {
+      const { contract, state, priv } = openAndBid(1000n, [900n]);
+      let s: any = state;
+      let p: any = priv;
+      for (const price of [800n, 700n, 600n]) {
+        const r = callRevised(contract, s, p, price);
+        s = r.chargedState;
+        p = r.privateState;
+      }
+      const publicState = readLedger(s);
+      expect(publicState.revision_count).toBe(3n);
+      expect(publicState.bid_count).toBe(4n); // 1 original + 3 revisions
+      expect(p.lastBid).toBe(600n);
+    });
+
+    it('a revision still over budget is counted but does not qualify', () => {
+      // Budget 500. First bid 2000 (over), revised down to 1500 (still over).
+      const { contract, state, priv } = openAndBid(500n, [2000n]);
+      const revised = callRevised(contract, state, priv, 1500n);
+      const s = readLedger(revised.chargedState);
+      expect(s.bid_count).toBe(2n);
+      expect(s.qualifying_count).toBe(0n);
+      expect(s.revision_count).toBe(1n);
+    });
+
+    it('a revision that crosses under budget starts qualifying', () => {
+      // Budget 1000. First bid 1200 (over, does not qualify), revised to 900.
+      const { contract, state, priv } = openAndBid(1000n, [1200n]);
+      const revised = callRevised(contract, state, priv, 900n);
+      const s = readLedger(revised.chargedState);
+      expect(s.bid_count).toBe(2n);
+      expect(s.qualifying_count).toBe(1n);
+      expect(s.revision_count).toBe(1n);
+    });
+
+    it('plain bids do not increment revision_count', () => {
+      const { state } = openAndBid(1000n, [900n, 800n, 700n]);
+      expect(readLedger(state).revision_count).toBe(0n);
+    });
+  });
+
   describe('Privacy model — private prices are never exposed', () => {
-    it('ledger exposes only the four public fields, never a price', () => {
+    it('ledger exposes only the five public fields, never a price', () => {
       const { contractState } = freshState();
       const publicState = ledger(contractState.data);
-      expect(Object.keys(publicState).sort()).toEqual(['bid_count', 'budget_max', 'is_open', 'qualifying_count']);
+      expect(Object.keys(publicState).sort()).toEqual(PUBLIC_LEDGER_FIELDS);
       expect((publicState as any).price).toBeUndefined();
+      expect((publicState as any).last_bid).toBeUndefined();
     });
 
     it('two different qualifying prices are indistinguishable on the public ledger', () => {
@@ -195,6 +313,37 @@ describe('Sealed Quote RFQ Contract', () => {
       const { state } = openAndBid(1000n, [777n]);
       const stateStr = state?.toString() ?? '';
       expect(stateStr).not.toContain('777');
+    });
+
+    it('revisions of very different magnitudes produce identical public state', () => {
+      // A supplier shaving 1 off their bid and a supplier halving it look
+      // exactly the same on-chain: one revision, one bid, both qualifying.
+      const tinyCut = openAndBid(1000n, [900n]);
+      const tinyRevised = callRevised(tinyCut.contract, tinyCut.state, tinyCut.priv, 899n);
+
+      const bigCut = openAndBid(1000n, [900n]);
+      const bigRevised = callRevised(bigCut.contract, bigCut.state, bigCut.priv, 450n);
+
+      expect(readLedger(tinyRevised.chargedState)).toEqual(readLedger(bigRevised.chargedState));
+    });
+
+    it('neither the previous nor the revised price is serialised into contract state', () => {
+      const { contract, state, priv } = openAndBid(10000n, [8421n]);
+      const revised = callRevised(contract, state, priv, 6317n);
+      const stateStr = revised.chargedState?.toString() ?? '';
+      expect(stateStr).not.toContain('8421');
+      expect(stateStr).not.toContain('6317');
+    });
+
+    it('the remembered previous bid lives only in private state, not public state', () => {
+      const { priv, state } = openAndBid(1000n, [842n]);
+      // Present privately...
+      expect(priv.lastBid).toBe(842n);
+      // ...and absent from every public field.
+      const publicState = readLedger(state) as any;
+      for (const field of PUBLIC_LEDGER_FIELDS) {
+        expect(publicState[field]).not.toBe(842n);
+      }
     });
   });
 });

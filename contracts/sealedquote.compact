@@ -5,36 +5,52 @@
  * submit sealed bids: each bid is checked against the budget entirely
  * inside a zero-knowledge proof, so a supplier's exact price is never
  * written to the chain, read by the buyer, or seen by rival suppliers.
- * Only two public facts ever land on-chain: how many bids came in, and
- * how many of them qualified (were at or under budget).
  *
- * PUBLIC (on-chain, visible to anyone):
+ * ── Midnight's dual ledger, as used here ────────────────────────────────
+ *
+ * PUBLIC LEDGER (on-chain, visible to anyone):
  *   - budget_max: the buyer's disclosed ceiling price. Buyers publish this
  *     deliberately — it is what attracts competitive bids in the first
  *     place, the same way a real RFQ states a budget range.
  *   - bid_count: total number of sealed bids submitted.
  *   - qualifying_count: how many of those bids were at or under budget.
+ *   - revision_count: how many bids were verified price improvements on
+ *     the same supplier's own earlier bid.
  *   - is_open: whether the RFQ is still accepting bids.
  *
- * PRIVATE (circuit input, never stored on-chain):
- *   - price: a supplier's exact bid. Consumed inside the proof and never
- *     disclosed — not to the buyer, not to rival suppliers, not to chain
- *     observers.
+ * PRIVATE STATE (per-supplier, local to their own device, never on-chain):
+ *   - last_bid: the price this supplier most recently bid on this RFQ.
+ *     Persisted locally between transactions via the `remember_bid`
+ *     witness and read back via `local_last_bid`. It is never written to
+ *     the public ledger and never leaves the supplier's machine.
  *
- * WHAT A SUPPLIER PROVES WITHOUT REVEALING:
- *   - That their price is at or under the buyer's published budget.
- *   - That their price is greater than zero (a well-formed bid).
- *   The exact price is never disclosed by the proof — only the boolean
- *   fact "this bid qualified" is.
+ * PRIVATE CIRCUIT INPUT (transient, never stored anywhere):
+ *   - price: the exact bid being submitted right now. Consumed inside the
+ *     proof and discarded.
  *
- * WHY THE WINNING PRICE ISN'T SETTLED ON-CHAIN HERE:
+ * ── What a supplier proves without revealing ────────────────────────────
+ *   - submit_bid:         "my price is > 0, and here is whether it is at
+ *                          or under the published budget" — without
+ *                          disclosing the price.
+ *   - submit_revised_bid: "this new bid is strictly lower than the bid I
+ *                          myself submitted earlier" — without disclosing
+ *                          either the new price or the old one.
+ *
+ * That second circuit is the reason this contract needs private state
+ * rather than just private inputs. Proving a bid improves on an earlier
+ * bid requires remembering the earlier bid, and the whole point is that
+ * nobody else — not the buyer, not rival suppliers, not chain observers —
+ * ever learns either number. The public ledger records only that a
+ * verified improvement happened.
+ *
+ * ── Why the winning price isn't settled on-chain here ───────────────────
  *   Trustlessly picking "the lowest of N sealed bids" on-chain requires
  *   comparing every bid against every other bid without ever revealing
  *   any of them — a sorting network in zero knowledge. That is real,
  *   solvable cryptography, but out of scope for this build (see
- *   PROPOSAL.md, "Mainnet Feasibility"). What this contract proves today
- *   is the part that is fully trustless with the tools at hand: bid
- *   validity and budget-eligibility. Final price negotiation between the
+ *   PROPOSAL.md, "Mainnet Feasibility"). Note that per-supplier price
+ *   improvement, implemented below, is the single-supplier case of that
+ *   same comparison problem, solved. Final price negotiation between the
  *   buyer and a qualifying supplier happens off-chain, over a private
  *   channel the buyer opens with a qualifying supplier of their choice —
  *   the same shape real-world sealed-bid procurement already uses.
@@ -43,11 +59,19 @@ pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 
-// ── Ledger state ─────────────────────────────────────────────────────────────
+// ── Public ledger state ──────────────────────────────────────────────────────
 export ledger budget_max: Uint<64>;
 export ledger bid_count: Counter;
 export ledger qualifying_count: Counter;
+export ledger revision_count: Counter;
 export ledger is_open: Boolean;
+
+// ── Private state access (witnesses) ─────────────────────────────────────────
+// Implemented in TypeScript (src/api/privateState.ts) against a private state
+// store the supplier controls. `local_last_bid` returns 0 when this supplier
+// has not yet bid on this RFQ.
+witness local_last_bid(): Uint<64>;
+witness remember_bid(price: Uint<64>): [];
 
 // ── Circuit: open_rfq ──────────────────────────────────────────────────────────
 // The buyer sets the public budget ceiling and opens bidding. budget_max is
@@ -69,6 +93,10 @@ export circuit open_rfq(budget: Uint<64>): [] {
 // disclose(qualifies) publishes exactly one bit per bid: did it qualify.
 // The price itself is never assigned to public state anywhere in this
 // circuit, so it never becomes disclosable.
+//
+// remember_bid stores the price in the supplier's own private state so a
+// later submit_revised_bid can prove an improvement against it. That write
+// is local: it does not touch the transaction or the public ledger.
 export circuit submit_bid(price: Uint<64>): [] {
   assert(is_open, "RFQ is not open for bids");
   assert(price > 0, "price must be positive");
@@ -76,6 +104,34 @@ export circuit submit_bid(price: Uint<64>): [] {
   const qualifies: Uint<8> = price <= budget_max ? 1 : 0;
   bid_count.increment(1);
   qualifying_count += disclose(qualifies);
+
+  remember_bid(price);
+}
+
+// ── Circuit: submit_revised_bid ────────────────────────────────────────────────
+// A supplier lowering their own earlier bid — the "best and final offer"
+// round of a real RFQ.
+//
+// Both numbers in the comparison are private: `price` is a private circuit
+// input, and `previous` comes out of the supplier's private state via a
+// witness. The assert below therefore proves a relationship between two
+// values that neither the buyer nor the chain ever sees. What lands publicly
+// is one increment of revision_count: "a verified price improvement
+// happened", with no indication of the magnitude or either endpoint.
+export circuit submit_revised_bid(price: Uint<64>): [] {
+  assert(is_open, "RFQ is not open for bids");
+  assert(price > 0, "price must be positive");
+
+  const previous = local_last_bid();
+  assert(previous > 0, "no earlier bid found in your private state for this RFQ");
+  assert(price < previous, "a revised bid must be strictly lower than your previous bid");
+
+  const qualifies: Uint<8> = price <= budget_max ? 1 : 0;
+  bid_count.increment(1);
+  qualifying_count += disclose(qualifies);
+  revision_count.increment(1);
+
+  remember_bid(price);
 }
 
 // ── Circuit: close_rfq ──────────────────────────────────────────────────────────

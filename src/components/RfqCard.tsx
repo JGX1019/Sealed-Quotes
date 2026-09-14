@@ -10,9 +10,20 @@
  */
 import { useState } from 'react';
 import type { ConnectedAPI } from '@midnight-ntwrk/dapp-connector-api';
-import { closeRfq, deployRfq, joinRfq, openRfq, readRfqState, submitBid, type RfqState } from '../api/contract';
+import {
+  closeRfq,
+  deployRfq,
+  hasPreviousBid,
+  joinRfq,
+  openRfq,
+  readRfqState,
+  submitBid,
+  submitRevisedBid,
+  type RfqState,
+} from '../api/contract';
 
 type TxStatus = 'idle' | 'deploying' | 'joining' | 'proving' | 'confirmed' | 'failed';
+type LastAction = 'open' | 'bid' | 'revise' | 'close';
 
 interface Props {
   connectedAPI: ConnectedAPI;
@@ -36,6 +47,14 @@ function friendlyError(e: any): string {
   }
   if (/rfq is not open/i.test(raw)) return 'This RFQ is not accepting bids right now.';
   if (/rfq is already closed/i.test(raw)) return 'This RFQ is already closed.';
+  // The revision circuit's two asserts, translated. Note neither message can
+  // echo the amounts involved — they're private, and the UI never learns them.
+  if (/strictly lower/i.test(raw)) {
+    return 'A revised bid must be strictly lower than your previous bid on this RFQ. The proof was rejected, so nothing was submitted.';
+  }
+  if (/no earlier bid/i.test(raw)) {
+    return 'No earlier bid found in this browser for this RFQ. Submit a first sealed bid before revising.';
+  }
   if (/budget must be positive|price must be positive/i.test(raw)) return raw;
   return raw;
 }
@@ -53,9 +72,18 @@ export function RfqCard({ connectedAPI }: Props) {
 
   const [budgetInput, setBudgetInput] = useState('1000');
   const [priceInput, setPriceInput] = useState('');
+  const [revisedPriceInput, setRevisedPriceInput] = useState('');
+
+  /**
+   * Whether this browser holds a remembered previous bid for this RFQ in
+   * private state. Deliberately a boolean and not the amount: showing the
+   * remembered price would undo the whole point of proving an improvement
+   * without disclosing either number.
+   */
+  const [hasPrevious, setHasPrevious] = useState(false);
 
   const [txStatus, setTxStatus] = useState<TxStatus>('idle');
-  const [lastAction, setLastAction] = useState<string | null>(null);
+  const [lastAction, setLastAction] = useState<LastAction | null>(null);
   const [txId, setTxId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -64,6 +92,7 @@ export function RfqCard({ connectedAPI }: Props) {
   const refresh = async (address: string) => {
     try {
       setRfq(await readRfqState(connectedAPI, address));
+      setHasPrevious(await hasPreviousBid(connectedAPI, address));
     } catch (e) {
       setError(friendlyError(e));
     }
@@ -77,7 +106,9 @@ export function RfqCard({ connectedAPI }: Props) {
       const address = contract.deployTxData.public.contractAddress;
       setDeployedContract(contract);
       setContractAddress(address);
-      setRfq({ budgetMax: 0n, bidCount: 0n, qualifyingCount: 0n, isOpen: false });
+      setRfq({ budgetMax: 0n, bidCount: 0n, qualifyingCount: 0n, revisionCount: 0n, isOpen: false });
+      // A freshly deployed RFQ can't have a remembered bid yet.
+      setHasPrevious(false);
       setTxStatus('idle');
     } catch (e) {
       setTxStatus('failed');
@@ -145,6 +176,31 @@ export function RfqCard({ connectedAPI }: Props) {
       // Clear the private price immediately — it has served its purpose as
       // a proof input and must not linger in UI state.
       setPriceInput('');
+      if (contractAddress) await refresh(contractAddress);
+    } catch (e) {
+      setTxStatus('failed');
+      setError(friendlyError(e));
+    }
+  };
+
+  const handleRevisedBid = async () => {
+    if (!deployedContract) return;
+    const price = BigInt(revisedPriceInput || '0');
+    if (price <= 0n) {
+      setError('Enter a revised bid price greater than zero.');
+      return;
+    }
+    setError(null);
+    setTxStatus('proving');
+    setLastAction('revise');
+    setTxId(null);
+    try {
+      const result = await submitRevisedBid(deployedContract, price);
+      setTxId(result.txId);
+      setTxStatus('confirmed');
+      // Same reasoning as handleBid: the revised price was only ever a proof
+      // input, so drop it from UI state as soon as the proof is built.
+      setRevisedPriceInput('');
       if (contractAddress) await refresh(contractAddress);
     } catch (e) {
       setTxStatus('failed');
@@ -238,6 +294,11 @@ export function RfqCard({ connectedAPI }: Props) {
           <p className="stat-value">{rfq ? `${rfq.qualifyingCount.toString()}` : '—'}</p>
           <p className="stat-note">{rfq ? `${qualifyRate(rfq)} at or under budget` : 'At or under budget'}</p>
         </div>
+        <div className="stat">
+          <span className="label">Revisions</span>
+          <p className="stat-value">{rfq ? rfq.revisionCount.toString() : '—'}</p>
+          <p className="stat-note">Proven price improvements</p>
+        </div>
       </div>
 
       <section className="section">
@@ -252,6 +313,17 @@ export function RfqCard({ connectedAPI }: Props) {
           <dt>Contract</dt>
           <dd className="mono break" title={contractAddress ?? ''}>
             {contractAddress}
+          </dd>
+          <dt>Your private state</dt>
+          <dd>
+            {hasPrevious ? (
+              <>
+                Previous bid remembered on this device
+                <span className="privacy-label"> (amount never shown, never sent on-chain)</span>
+              </>
+            ) : (
+              'No bid remembered on this device yet'
+            )}
           </dd>
         </dl>
 
@@ -314,6 +386,43 @@ export function RfqCard({ connectedAPI }: Props) {
           </div>
         )}
 
+        {rfq && rfq.budgetMax > 0n && rfq.isOpen && hasPrevious && (
+          <div className="rfq-panel">
+            <label htmlFor="revised-price-input" className="label">
+              Supplier: revise your bid downward
+            </label>
+            <div className="join-inputs" style={{ marginTop: '0.5rem' }}>
+              <input
+                id="revised-price-input"
+                type="number"
+                min="1"
+                value={revisedPriceInput}
+                onChange={(e) => setRevisedPriceInput(e.target.value)}
+                placeholder="Your new, lower price"
+                className="input"
+              />
+              <button
+                onClick={handleRevisedBid}
+                disabled={busy || !revisedPriceInput}
+                className="btn btn-primary"
+              >
+                {txStatus === 'proving' && lastAction === 'revise' ? (
+                  <>
+                    <span className="spinner" aria-hidden="true" /> Proving
+                  </>
+                ) : (
+                  'Submit Revised Bid'
+                )}
+              </button>
+            </div>
+            <p className="privacy-label">
+              This browser remembers your last bid in <strong>private state</strong> — on your device only, never
+              on-chain. The proof shows your new bid is strictly lower than it, without revealing either number.
+              The ledger records only that a verified improvement happened.
+            </p>
+          </div>
+        )}
+
         <div className="actions">
           <div className="actions-row">
             <button onClick={() => contractAddress && refresh(contractAddress)} disabled={busy} className="btn btn-secondary">
@@ -338,6 +447,16 @@ export function RfqCard({ connectedAPI }: Props) {
             <p>
               Building a zero-knowledge proof in your browser. This proves your price is at or under the buyer's
               budget without revealing what it was.
+            </p>
+          </div>
+        )}
+
+        {txStatus === 'proving' && lastAction === 'revise' && (
+          <div className="status status-working" role="status">
+            <p>
+              Building a zero-knowledge proof in your browser. Both numbers being compared are private — your new
+              bid, and the previous one read from your local private state. The proof establishes that the new bid
+              is lower without disclosing either.
             </p>
           </div>
         )}

@@ -1,17 +1,24 @@
 import type * as __compactRuntime from '@midnight-ntwrk/compact-runtime';
 
 export type Witnesses<PS> = {
+  local_last_bid(context: __compactRuntime.WitnessContext<Ledger, PS>): [PS, bigint];
+  remember_bid(context: __compactRuntime.WitnessContext<Ledger, PS>,
+               price_0: bigint): [PS, []];
 }
 
 export type ImpureCircuits<PS> = {
   open_rfq(context: __compactRuntime.CircuitContext<PS>, budget_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
+                     price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   close_rfq(context: __compactRuntime.CircuitContext<PS>): __compactRuntime.CircuitResults<PS, []>;
 }
 
 export type ProvableCircuits<PS> = {
   open_rfq(context: __compactRuntime.CircuitContext<PS>, budget_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
+                     price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   close_rfq(context: __compactRuntime.CircuitContext<PS>): __compactRuntime.CircuitResults<PS, []>;
 }
 
@@ -21,6 +28,8 @@ export type PureCircuits = {
 export type Circuits<PS> = {
   open_rfq(context: __compactRuntime.CircuitContext<PS>, budget_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
+                     price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   close_rfq(context: __compactRuntime.CircuitContext<PS>): __compactRuntime.CircuitResults<PS, []>;
 }
 
@@ -28,6 +37,7 @@ export type Ledger = {
   readonly budget_max: bigint;
   readonly bid_count: bigint;
   readonly qualifying_count: bigint;
+  readonly revision_count: bigint;
   readonly is_open: boolean;
 }
 

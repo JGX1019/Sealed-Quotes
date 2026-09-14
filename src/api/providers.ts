@@ -1,13 +1,19 @@
 /**
  * providers.ts — builds the ContractProviders set for browser-side contract
- * deployment and circuit calls, using the connected Lace wallet for
- * proving, balancing, and submission instead of a Node.js script wallet.
+ * deployment and circuit calls, using the connected Midnight-compatible
+ * wallet for proving, balancing, and submission instead of a Node.js
+ * script wallet.
  *
  * This is the key architectural difference from the CLI deploy path
- * (src/deploy.ts): Lace owns wallet sync internally (it's a long-running
- * browser extension, typically already synced), so the dApp never opens
- * its own raw indexer subscription the way the Node script does. That
+ * (src/deploy.ts): the wallet extension owns its own sync internally (it's
+ * long-running and typically already synced), so the dApp never opens its
+ * own raw indexer subscription the way the Node script does. That
  * sidesteps the sync-stall issue seen with the CLI deploy against Preprod.
+ *
+ * Private state is persisted through a real localStorage-backed provider
+ * (browserPrivateStateProvider), not a no-op: the supplier's own previous
+ * bid has to survive between transactions for `submit_revised_bid` to
+ * prove an improvement against it.
  */
 import type { ConnectedAPI } from '@midnight-ntwrk/dapp-connector-api';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
@@ -17,8 +23,10 @@ import { dappConnectorProofProvider } from '@midnight-ntwrk/midnight-js-dapp-con
 import * as ledger from '@midnight-ntwrk/ledger-v8';
 import type { MidnightProvider, WalletProvider } from '@midnight-ntwrk/midnight-js-types';
 import { fromHex, toHex } from '@midnight-ntwrk/midnight-js-utils';
+import { browserPrivateStateProvider } from './browserPrivateStateProvider.js';
+import type { SealedQuotePrivateState } from './privateState.js';
 
-const CIRCUIT_IDS = ['open_rfq', 'submit_bid', 'close_rfq'] as const;
+const CIRCUIT_IDS = ['open_rfq', 'submit_bid', 'submit_revised_bid', 'close_rfq'] as const;
 type CircuitId = (typeof CIRCUIT_IDS)[number];
 
 /**
@@ -113,46 +121,12 @@ export async function buildProviders(connectedAPI: ConnectedAPI) {
   const proofProvider = await dappConnectorProofProvider(connectedAPI, zkConfigProvider, ledger.CostModel.initialCostModel());
 
   return {
-    privateStateProvider: noopPrivateStateProvider(),
+    privateStateProvider: browserPrivateStateProvider<SealedQuotePrivateState>('sealedquote'),
     publicDataProvider: indexerPublicDataProvider(indexer.http, indexer.ws, window.WebSocket as any),
     zkConfigProvider,
     proofProvider,
     walletProvider: walletAndMidnightProvider,
     midnightProvider: walletAndMidnightProvider,
-  };
-}
-
-/**
- * The sealedquote contract declares no private state (its Witnesses type
- * is `{}`), so the browser never actually needs to persist anything here.
- * midnight-js still requires a PrivateStateProvider on the providers
- * object, so this satisfies that shape with in-memory no-ops.
- */
-function noopPrivateStateProvider(): any {
-  const store = new Map<string, unknown>();
-  const signingKeys = new Map<string, unknown>();
-  return {
-    setContractAddress: () => {},
-    set: async (id: string, state: unknown) => void store.set(id, state),
-    get: async (id: string) => (store.has(id) ? store.get(id) : null),
-    remove: async (id: string) => void store.delete(id),
-    clear: async () => store.clear(),
-    setSigningKey: async (address: string, key: unknown) => void signingKeys.set(address, key),
-    getSigningKey: async (address: string) => (signingKeys.has(address) ? signingKeys.get(address) : null),
-    removeSigningKey: async (address: string) => void signingKeys.delete(address),
-    clearSigningKeys: async () => signingKeys.clear(),
-    exportPrivateStates: async () => {
-      throw new Error('Export is not supported: this contract has no private state.');
-    },
-    importPrivateStates: async () => {
-      throw new Error('Import is not supported: this contract has no private state.');
-    },
-    exportSigningKeys: async () => {
-      throw new Error('Export is not supported.');
-    },
-    importSigningKeys: async () => {
-      throw new Error('Import is not supported.');
-    },
   };
 }
 

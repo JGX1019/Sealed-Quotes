@@ -42,6 +42,25 @@
       }
     },
     {
+      "name": "submit_revised_bid",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "price",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    },
+    {
       "name": "close_rfq",
       "pure": false,
       "proof": true,
@@ -55,6 +74,32 @@
     }
   ],
   "witnesses": [
+    {
+      "name": "local_last_bid",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Uint",
+        "maxval": 18446744073709551615
+      }
+    },
+    {
+      "name": "remember_bid",
+      "arguments": [
+        {
+          "name": "price",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
+        }
+      ],
+      "result type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    }
   ],
   "contracts": [
   ],
@@ -82,8 +127,14 @@
       "storage": "Counter"
     },
     {
-      "name": "is_open",
+      "name": "revision_count",
       "index": 3,
+      "exported": true,
+      "storage": "Counter"
+    },
+    {
+      "name": "is_open",
+      "index": 4,
       "exported": true,
       "storage": "Cell",
       "type": {
