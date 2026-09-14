@@ -18,23 +18,75 @@
 
 A buyer posts a request-for-quote with a public budget ceiling. Suppliers submit sealed bids: each price is checked against the budget entirely inside a zero-knowledge proof generated in the supplier's browser, so the exact price never touches the chain, never reaches the buyer, and is never visible to rival suppliers. The only public facts are how many bids came in and how many of those bids were at or under budget.
 
+Suppliers can also **revise a bid downward**. The contract proves the new bid is strictly lower than that supplier's own previous bid — comparing two numbers that are both private, one a fresh circuit input and one read back from the supplier's local private state. The buyer gets cryptographic proof that a "best and final offer" round genuinely improved, without learning either price or the size of the cut.
+
 This is aimed at B2B procurement, where sealed bidding is the norm but rarely actually sealed — suppliers routinely bid conservatively because they suspect a competitor can infer their price from a leak. SealedQuote makes "sealed" a cryptographic property instead of a promise.
 
-**Honest scope note:** this build does not pick or settle a winner on-chain — trustlessly comparing every sealed bid against every other one to find the lowest is real cryptography (an argmin circuit over private values) that didn't fit the timeline. What's implemented is the fully trustless part: proving a bid is well-formed and budget-eligible without revealing it. See [PROPOSAL.md](./PROPOSAL.md) for what a production version adds.
+**Honest scope note:** this build does not pick or settle a winner on-chain — trustlessly comparing every sealed bid against every *other supplier's* bid to find the lowest is an argmin circuit over private values, which didn't fit the timeline. The per-supplier comparison in `submit_revised_bid` is the single-supplier case of that same problem, solved. See [PROPOSAL.md](./PROPOSAL.md) for what a production version adds.
 
 ## Privacy Model
 
-- **PUBLIC:** `budget_max` (the buyer's disclosed ceiling), `bid_count` (total sealed bids), `qualifying_count` (bids at or under budget), and `is_open` (whether the RFQ still accepts bids).
-- **PRIVATE:** `price` — a supplier's exact bid. It's a private circuit parameter, consumed inside the ZK proof, and never stored on-chain or transmitted anywhere.
-- **PROVED without revealing:** that the price is a well-formed, positive bid, and that it is at or under the buyer's published budget — without disclosing the price itself, only the boolean fact that it qualified.
+SealedQuote uses both halves of Midnight's dual ledger: a public on-chain ledger, and a per-supplier private state that lives only on the supplier's own device.
+
+- **PUBLIC (on-chain ledger):** `budget_max` (the buyer's disclosed ceiling), `bid_count` (total sealed bids), `qualifying_count` (bids at or under budget), `revision_count` (proven price improvements), and `is_open` (whether the RFQ still accepts bids).
+- **PRIVATE STATE (persisted locally, never on-chain):** `lastBid` — the price this supplier most recently bid on this RFQ. Written by the `remember_bid` witness, read back by the `local_last_bid` witness. It exists so a revision can be proven against it, and it is never serialised into a transaction. The UI never displays it either — it only shows whether *some* previous bid exists.
+- **PRIVATE CIRCUIT INPUT (transient):** `price` — the exact bid being submitted right now. Consumed inside the ZK proof and discarded; never stored anywhere.
+- **PROVED without revealing:**
+  - that the price is a well-formed, positive bid;
+  - that it is at or under the buyer's published budget — disclosing only the boolean fact that it qualified;
+  - and for a revision, that the new price is *strictly lower than the supplier's own previous price* — where **both** numbers are private, so the proof establishes a relationship between two values nobody else ever sees.
+
+### Where each piece of state lives
+
+| State | Lives on | Written by | Readable by |
+|-------|----------|-----------|-------------|
+| `budget_max`, `bid_count`, `qualifying_count`, `revision_count`, `is_open` | Public ledger | Circuits, via `disclose()` | Anyone |
+| `lastBid` | Supplier's browser (private state provider) | `remember_bid` witness | Only that supplier's device |
+| `price` | Nowhere — exists only inside the proof | n/a | No one |
 
 ## Privacy Claim
 
-**What an on-chain observer can learn:** the contract address; the buyer's published budget; the total number of bids; how many of them qualified; whether the RFQ is still open; and, for each bid transaction, which wallet submitted it and whether that specific bid qualified.
+**What an on-chain observer can learn:** the contract address; the buyer's published budget; the total number of bids; how many of them qualified; how many were proven improvements on an earlier bid; whether the RFQ is still open; and, for each transaction, which wallet submitted it, whether that specific bid qualified, and whether it was a revision.
 
-**What an on-chain observer cannot learn:** the exact price of any bid, by anyone, at any time. A $10 bid and a $9,999 bid that both qualify are indistinguishable on the ledger; so are two different over-budget bids. No transcript, ledger field, or proof artifact contains a price, and there's no on-chain record linking a wallet to an amount.
+**What an on-chain observer cannot learn:** the exact price of any bid, by anyone, at any time. A $10 bid and a $9,999 bid that both qualify are indistinguishable on the ledger; so are two different over-budget bids. For revisions, neither the old price, the new price, nor the *difference between them* is disclosed — a supplier shaving 1 off their bid and a supplier halving it produce byte-identical public state. No transcript, ledger field, or proof artifact contains a price, and there's no on-chain record linking a wallet to an amount.
 
-**Honest limitation:** because `qualifying_count` updates once per bid transaction, an observer watching individual transactions learns one bit per bid — whether it qualified. The exact price stays hidden, but that single bit is disclosed by design, since publishing a verifiable qualification rate is the point. Selecting and settling a specific winning price on-chain without any bid being read at all is out of scope for this build — see [PROPOSAL.md](./PROPOSAL.md), "Mainnet Feasibility."
+**Honest limitations**, stated plainly:
+
+1. **One bit per bid.** Because `qualifying_count` updates once per bid transaction, an observer watching individual transactions learns whether that bid qualified. The exact price stays hidden, but that single bit is disclosed by design — publishing a verifiable qualification rate is the point of the product.
+2. **One bit per revision.** Likewise, `revision_count` reveals that a supplier improved their own bid. The magnitude is not disclosed, but the fact of the improvement is.
+3. **Private state is stored unencrypted in `localStorage`.** It never leaves the device, so the buyer, rival suppliers, and chain observers cannot read it — which is the threat model this product cares about. It is *not* protected against someone who already controls the supplier's machine or another script on the same origin. A production deployment should use the wallet's own encrypted private state storage instead; see [PROPOSAL.md](./PROPOSAL.md).
+4. **No on-chain winner selection.** Selecting and settling a specific winning price across suppliers is out of scope for this build — see [PROPOSAL.md](./PROPOSAL.md), "Mainnet Feasibility."
+
+## Architecture
+
+### Contract
+
+`contracts/sealedquote.compact` declares five public ledger fields, two witnesses, and four circuits:
+
+| Circuit | Private input | Reads private state | Public effect |
+|---------|--------------|---------------------|---------------|
+| `open_rfq(budget)` | — (budget is deliberately disclosed) | no | sets `budget_max`, `is_open = true` |
+| `submit_bid(price)` | `price` | no | `bid_count +1`, `qualifying_count +0/1` |
+| `submit_revised_bid(price)` | `price` | yes — `local_last_bid()` | `bid_count +1`, `qualifying_count +0/1`, `revision_count +1` |
+| `close_rfq()` | — | no | `is_open = false` |
+
+The two witnesses are the private-state boundary:
+
+```compact
+witness local_last_bid(): Uint<64>;      // read this supplier's previous bid
+witness remember_bid(price: Uint<64>): []; // persist the bid just made
+```
+
+`submit_revised_bid` is where the dual ledger earns its keep. It asserts `price < previous` where `price` is a private circuit input and `previous` came out of private state via a witness — so the assertion constrains two values, neither of which is on-chain. If the assertion fails, no valid proof exists and the transaction cannot be produced at all. What lands publicly is a single increment.
+
+### Private state flow
+
+1. A supplier submits a bid. `submit_bid` proves it against the budget, then calls `remember_bid(price)`.
+2. The runtime hands the witness's returned private state to the `PrivateStateProvider`, which writes it to `localStorage`, namespaced by contract address.
+3. On a later revision, `local_last_bid()` reads it back into the circuit.
+4. The frontend asks only *whether* a previous bid exists (`hasPreviousBid`), never the amount, so the remembered price is never rendered.
+
+Everything in steps 1–4 happens on the supplier's machine. The only thing that crosses the network is a proof and the public counter updates.
 
 ## Tech Stack
 
@@ -85,11 +137,19 @@ npm run dev
 npm test
 ```
 
-20 tests passing, covering:
+**59 tests passing** across two suites.
 
-- **Circuit logic** — the open → bid → close lifecycle, budget and price validation (zero/negative rejected), bids rejected before opening or after closing, and re-closing an already-closed RFQ rejected.
+`tests/sealedquote.test.ts` (36) drives the real compiled contract with the real witness implementations:
+
+- **Circuit logic** — the open → bid → close lifecycle, budget and price validation (zero rejected), bids rejected before opening or after closing, and re-closing an already-closed RFQ rejected.
 - **State transitions** — bid and qualifying counts accumulate correctly across many suppliers, all-qualifying and all-over-budget rounds, and `qualifying_count` never exceeding `bid_count`.
-- **Privacy** — the ledger exposes only the four public fields and never a price; two different qualifying prices (or two different over-budget prices) are indistinguishable on the public ledger; different bid sequences with the same qualify profile produce identical public state; and the bid price never appears in the serialized contract state.
+- **Private state** — a fresh supplier has no remembered bid; `submit_bid` records the price locally; revisions are rejected with no prior bid, rejected when equal or higher, and accepted when strictly lower; a chain of successive reductions works; a revision that crosses under budget starts qualifying; plain bids never touch `revision_count`.
+- **Privacy** — the ledger exposes only the five public fields and never a price; two different qualifying prices (or two different over-budget prices) are indistinguishable; revisions of very different magnitudes produce identical public state; neither the old nor the new price appears in serialized contract state; and the remembered previous bid is present privately while absent from every public field.
+
+`tests/privateState.test.ts` (23) unit-tests the private-state layer itself:
+
+- **Witnesses** — reading a remembered bid, defaulting to 0 for a new or malformed state, and never mutating the state passed in.
+- **Provider** — refuses reads/writes before a contract address is set, round-trips `bigint` values losslessly (including above `Number.MAX_SAFE_INTEGER`, which a naive JSON round-trip would corrupt), persists across provider instances (i.e. survives a page reload), isolates state between contract addresses, and discards corrupted entries instead of throwing.
 
 ## CI/CD
 
@@ -98,10 +158,12 @@ npm test
 1. Checks out the repository
 2. Installs Node.js v22 (with npm caching)
 3. Installs dependencies with `npm install --legacy-peer-deps`
-4. Installs the Compact compiler CLI, then runs `compact update` to fetch the toolchain binary
+4. Installs the Compact compiler CLI, then runs `compact update 0.31.1` to fetch the toolchain binary
 5. Compiles `sealedquote.compact`
 6. Runs the full Jest test suite
 7. Builds the production frontend bundle
+
+The toolchain version is **pinned deliberately**. `compact compile` overwrites the committed `managed/` output, and newer compilers emit async circuit signatures (`Promise<CircuitResults<..>>`). With an unpinned `compact update`, CI would typecheck the test suite against different types than it was written for and the suite would fail to compile — which is exactly what happened on the first run. 0.31.1 is the compiler recorded in `managed/sealedquote/compiler/contract-info.json`.
 
 ## Product Proposal
 
@@ -114,18 +176,21 @@ See [PROPOSAL.md](./PROPOSAL.md)
 ## Project Structure
 
 ```
-contracts/sealedquote.compact     — the RFQ contract
-managed/                          — compiler output (ZK keys, zkir, compiled JS)
-public/managed/sealedquote/       — ZK keys/zkir served to the browser at runtime
-src/contract/sealedquote.js       — compiled contract JS, statically imported by the frontend
-src/hooks/useMidnight.ts          — wallet connect/disconnect hook
-src/components/WalletConnect.tsx  — wallet connect/disconnect UI
-src/components/RfqCard.tsx        — deploy/join, budget setup, sealed bid form, tallies
-src/api/providers.ts              — browser-side midnight-js providers backed by the wallet
-src/api/contract.ts               — deploy/join + typed circuit call helpers
-tests/sealedquote.test.ts         — contract test suite (20 tests)
-.github/workflows/ci.yml          — CI pipeline
-PROPOSAL.md                       — product proposal
+contracts/sealedquote.compact          — the RFQ contract (4 circuits, 2 witnesses)
+managed/                               — compiler output (ZK keys, zkir, compiled JS)
+public/managed/sealedquote/            — ZK keys/zkir served to the browser at runtime
+src/contract/sealedquote.js            — compiled contract JS, statically imported by the frontend
+src/hooks/useMidnight.ts               — wallet connect/disconnect hook
+src/components/WalletConnect.tsx       — wallet connect/disconnect UI
+src/components/RfqCard.tsx             — deploy/join, budget setup, sealed bid + revision forms, tallies
+src/api/providers.ts                   — browser-side midnight-js providers backed by the wallet
+src/api/contract.ts                    — deploy/join + typed circuit call helpers
+src/api/privateState.ts                — private state type + witness implementations
+src/api/browserPrivateStateProvider.ts — persisting PrivateStateProvider (localStorage)
+tests/sealedquote.test.ts              — contract test suite (36 tests)
+tests/privateState.test.ts             — private state + witness test suite (23 tests)
+.github/workflows/ci.yml               — CI pipeline
+PROPOSAL.md                            — product proposal
 ```
 
 ## Note on deployment path
