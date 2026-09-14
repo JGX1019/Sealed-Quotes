@@ -33,15 +33,24 @@ jobs:
       # Not optional: the installer script only fetches the CLI wrapper, not the
       # toolchain binary itself. Without `compact update`, every subsequent
       # `compact compile` fails with "No default compiler set".
-      - name: Download Compact toolchain
+      #
+      # The version is pinned deliberately. A bare `compact update` installs the
+      # latest toolchain, and newer compilers emit async circuit signatures
+      # (`Promise<CircuitResults<..>>`). Since `compact compile` overwrites the
+      # committed `managed/` output, an unpinned toolchain makes CI typecheck the
+      # test suite against different types than the ones it was written for, and
+      # the suite fails to compile. 0.31.1 is the compiler that produced the
+      # checked-in `managed/` output — see managed/sealedquote/compiler/contract-info.json.
+      - name: Download Compact toolchain (pinned)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          compact update
+          compact update 0.31.1
 
       - name: Verify Compact version
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           compact --version
+          compact compile --version || true
 
       - name: Compile sealedquote contract
         run: |
