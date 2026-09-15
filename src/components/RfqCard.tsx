@@ -8,7 +8,7 @@
  * rendered back to the user, never logged, and never included in any
  * result view — only the public bid/qualifying counters change.
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ConnectedAPI } from '@midnight-ntwrk/dapp-connector-api';
 import {
   closeRfq,
@@ -24,6 +24,18 @@ import {
 
 type TxStatus = 'idle' | 'deploying' | 'joining' | 'proving' | 'confirmed' | 'failed';
 type LastAction = 'open' | 'bid' | 'revise' | 'close';
+
+/**
+ * The RFQ this deployment ships pointed at by default, so a visitor never has
+ * to know or paste a contract address to try the app — they land straight on
+ * a live RFQ. Deployed to Preprod; verified on-chain via the public indexer.
+ *
+ * "Post New RFQ" still deploys a fresh contract and switches to it, and the
+ * join field still accepts any other address, so this default doesn't limit
+ * what the app can do — it only removes the friction of a blank first
+ * screen.
+ */
+const DEFAULT_CONTRACT_ADDRESS = '56e3132cde0d680024483bd073c055e1e0c88789b9f0011f759c50c991044490';
 
 interface Props {
   connectedAPI: ConnectedAPI;
@@ -87,6 +99,12 @@ export function RfqCard({ connectedAPI }: Props) {
   const [txId, setTxId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Tracks the background auto-load of DEFAULT_CONTRACT_ADDRESS separately
+  // from txStatus, so a failed silent join doesn't leave `busy` stuck true
+  // and doesn't surface as a user-facing error (see joinAddress's `silent`
+  // option) — it only gates the loading message on the initial screen.
+  const [autoLoading, setAutoLoading] = useState(true);
+
   const busy = txStatus === 'deploying' || txStatus === 'joining' || txStatus === 'proving';
 
   const refresh = async (address: string) => {
@@ -116,25 +134,56 @@ export function RfqCard({ connectedAPI }: Props) {
     }
   };
 
+  /**
+   * Joins the RFQ at `address`. Shared by the manual "Join" button and the
+   * auto-load effect below — `silent` suppresses the join spinner/errors for
+   * the automatic case, since a background attempt to load the default RFQ
+   * failing should not block someone who is about to paste in their own
+   * address anyway.
+   */
+  const joinAddress = async (address: string, options: { silent?: boolean } = {}) => {
+    if (!options.silent) {
+      setError(null);
+      setTxStatus('joining');
+    }
+    try {
+      const contract = await joinRfq(connectedAPI, address);
+      setDeployedContract(contract);
+      setContractAddress(address);
+      await refresh(address);
+      if (!options.silent) setTxStatus('idle');
+    } catch (e) {
+      if (options.silent) {
+        console.warn(`Could not auto-load the default RFQ (${address}):`, e);
+      } else {
+        setTxStatus('failed');
+        setError(friendlyError(e));
+      }
+    } finally {
+      if (options.silent) setAutoLoading(false);
+    }
+  };
+
   const handleJoin = async () => {
     const address = addressInput.trim();
     if (!address) {
       setError('Enter a contract address to join.');
       return;
     }
-    setError(null);
-    setTxStatus('joining');
-    try {
-      const contract = await joinRfq(connectedAPI, address);
-      setDeployedContract(contract);
-      setContractAddress(address);
-      await refresh(address);
-      setTxStatus('idle');
-    } catch (e) {
-      setTxStatus('failed');
-      setError(friendlyError(e));
-    }
+    await joinAddress(address);
   };
+
+  // Auto-load the default RFQ as soon as the wallet connects, so a visitor
+  // lands on a live RFQ instead of a blank "post or join" screen. Runs once
+  // per connection; posting a new RFQ or joining a different one afterwards
+  // simply replaces `deployedContract`, so this never fights a manual action.
+  useEffect(() => {
+    setAddressInput(DEFAULT_CONTRACT_ADDRESS);
+    void joinAddress(DEFAULT_CONTRACT_ADDRESS, { silent: true });
+    // connectedAPI changes when the wallet (re)connects — re-attempt the
+    // auto-load in that case, but not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectedAPI]);
 
   const handleOpen = async () => {
     if (!deployedContract) return;
@@ -231,6 +280,12 @@ export function RfqCard({ connectedAPI }: Props) {
         <div className="section-head">
           <h2>RFQ</h2>
         </div>
+
+        {autoLoading && (
+          <p className="hint">
+            <span className="spinner" aria-hidden="true" /> Loading the default RFQ…
+          </p>
+        )}
 
         <button onClick={handleDeploy} disabled={busy} className="btn btn-primary btn-block">
           {txStatus === 'deploying' ? (
