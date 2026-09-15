@@ -9,6 +9,8 @@
 import { CompiledContract } from '@midnight-ntwrk/compact-js';
 import { deployContract, findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts';
 import type { ConnectedAPI } from '@midnight-ntwrk/dapp-connector-api';
+import { getNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
+import { parseCoinPublicKeyToHex } from '@midnight-ntwrk/midnight-js-utils';
 import { Contract, ledger } from '../contract/sealedquote.js';
 import { buildProviders } from './providers.js';
 import { emptyPrivateState, PRIVATE_STATE_ID, witnesses, type SealedQuotePrivateState } from './privateState.js';
@@ -28,6 +30,8 @@ export interface RfqState {
   revisionCount: bigint;
   isInitialized: boolean;
   isOpen: boolean;
+  /** Absolute Unix-seconds deadline past which bids are rejected on-chain, or 0n for no deadline. */
+  closesAt: bigint;
   /** Hex-encoded buyer coin public key, for the "is this caller the buyer?" check in the UI. */
   buyerKeyHex: string;
 }
@@ -155,11 +159,11 @@ export async function joinRfq(connectedAPI: ConnectedAPI, contractAddress: strin
 }
 
 /**
- * Buyer action: publishes the title, budget ceiling, and unit, and opens the
- * RFQ for bids. Can only succeed once per contract — the circuit asserts
- * `!is_initialized`, so a second call (e.g. trying to change the budget
- * after bids exist) fails rather than silently overwriting the terms
- * suppliers already bid against.
+ * Buyer action: publishes the title, budget ceiling, unit, and an optional
+ * bidding deadline, and opens the RFQ for bids. Can only succeed once per
+ * contract — the circuit asserts `!is_initialized`, so a second call (e.g.
+ * trying to change the budget after bids exist) fails rather than silently
+ * overwriting the terms suppliers already bid against.
  *
  * `title` is what the budget is for (e.g. "40 office chairs"). `unit` is a
  * display label ("USD", "USDC", "tDUST", ...) for what `budget` and every
@@ -167,10 +171,26 @@ export async function joinRfq(connectedAPI: ConnectedAPI, contractAddress: strin
  * on-chain, and informational only — the contract does not move or verify
  * any actual currency or interpret the title; see the header comment in
  * sealedquote.compact.
+ *
+ * `durationSeconds` is how long bidding should stay open, starting now.
+ * Pass `0n` (or omit it) for no deadline — bidding then stays open until
+ * the buyer calls `closeRfq`. When nonzero, this function computes the
+ * absolute deadline (`now + durationSeconds`, in Unix seconds) and sends
+ * that to the contract, which is what actually gets enforced on every
+ * subsequent bid via `blockTimeLt` — checked against the block's own clock,
+ * not this client's, so this computation only decides the deadline's
+ * *value*, not whether it's honestly enforced afterward.
  */
-export async function openRfq(deployedContract: any, title: string, budget: bigint, unit: string) {
+export async function openRfq(
+  deployedContract: any,
+  title: string,
+  budget: bigint,
+  unit: string,
+  durationSeconds: bigint = 0n,
+) {
+  const deadlineAt = durationSeconds > 0n ? BigInt(Math.floor(Date.now() / 1000)) + durationSeconds : 0n;
   const result: any = await withTimeout(
-    deployedContract.callTx.open_rfq(encodeTitle(title), budget, encodeUnitLabel(unit)),
+    deployedContract.callTx.open_rfq(encodeTitle(title), budget, encodeUnitLabel(unit), deadlineAt),
     120_000,
     'Open RFQ',
   );
@@ -244,30 +264,46 @@ export async function readRfqState(connectedAPI: ConnectedAPI, contractAddress: 
     revisionCount: publicState.revision_count,
     isInitialized: publicState.is_initialized,
     isOpen: publicState.is_open,
+    closesAt: publicState.closes_at,
     buyerKeyHex: coinPublicKeyToHex(publicState.buyer_key),
   };
 }
+
+export { isPastDeadline } from './isPastDeadline.js';
 
 /**
  * Whether the currently connected wallet is the buyer who opened this RFQ.
  * Compares the wallet's own coin public key against the on-chain `buyer_key`
  * — the same comparison the contract itself makes via `ownPublicKey()` in
  * `submit_bid`/`close_rfq`, done here so the UI can hide actions the
- * contract would reject anyway (e.g. showing "Submit a bid" to the buyer).
+ * contract would reject anyway (e.g. showing "Submit a bid" to the buyer,
+ * or hiding "Close RFQ" from anyone but the buyer).
  *
  * This is a UI convenience, not the enforcement boundary — the contract's
  * own `ownPublicKey()` checks are what actually stop a disallowed call. See
  * "On-chain identity checks" in sealedquote.compact for the honest limits
  * of that guarantee.
  *
- * `getCoinPublicKey()` already returns a hex string (see providers.ts,
- * where it's set from the wallet's `shieldedCoinPublicKey`), so no Bech32m
- * parsing is needed here — only a case-insensitive string comparison
- * against the hex the ledger's `buyer_key` decodes to.
+ * Bug fix: this previously compared `getCoinPublicKey()` directly against
+ * `buyerKeyHex` as if both were hex. They weren't. `getCoinPublicKey()` is
+ * wired (in providers.ts) to the wallet's `shieldedCoinPublicKey`, and the
+ * DApp Connector API's own documentation is explicit that
+ * `getShieldedAddresses()` returns everything in **Bech32m** format, not
+ * hex. `buyerKeyHex` is hex — it comes from the ledger's `buyer_key` field
+ * decoded byte-for-byte. Comparing a Bech32m string against a hex string is
+ * never true, for anyone, including the actual buyer — so `isBuyer()`
+ * always returned `false`, the "Close RFQ" button never rendered even for
+ * the wallet that opened the RFQ, and "Your role" always read "Supplier."
+ * midnight-js's own call/deploy path normalises the same value with
+ * `parseCoinPublicKeyToHex(key, networkId)` before comparing or embedding
+ * it in a transaction (see `createUnprovenCallTx` in
+ * `@midnight-ntwrk/midnight-js-contracts`) — this now does the same.
  */
 export async function isBuyer(connectedAPI: ConnectedAPI, buyerKeyHex: string): Promise<boolean> {
   if (!buyerKeyHex) return false;
-  const providers = await buildProviders(connectedAPI);
-  const ownKeyHex = providers.walletProvider.getCoinPublicKey();
-  return !!ownKeyHex && ownKeyHex.toLowerCase() === buyerKeyHex.toLowerCase();
+  const providers = await buildProviders(connectedAPI); // calls setNetworkId(...) internally
+  const ownKeyRaw = providers.walletProvider.getCoinPublicKey();
+  if (!ownKeyRaw) return false;
+  const ownKeyHex = parseCoinPublicKeyToHex(ownKeyRaw, getNetworkId());
+  return ownKeyHex.toLowerCase() === buyerKeyHex.toLowerCase();
 }

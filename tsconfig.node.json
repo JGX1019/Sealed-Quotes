@@ -24,6 +24,7 @@
     "src/deploy.ts",
     "src/api/privateState.ts",
     "src/api/browserPrivateStateProvider.ts",
+    "src/api/isPastDeadline.ts",
     "tests",
     "vite.config.ts"
   ],

@@ -15,6 +15,7 @@ import {
   deployRfq,
   hasPreviousBid,
   isBuyer,
+  isPastDeadline,
   joinRfq,
   openRfq,
   readRfqState,
@@ -36,14 +37,16 @@ type LastAction = 'open' | 'bid' | 'revise' | 'close';
  * what the app can do — it only removes the friction of a blank first
  * screen.
  *
- * Empty for now: the previous default (56e3132c...) was deployed against an
- * older circuit shape — `open_rfq(budget, unit)` with no title, no
- * `buyer_key`, no `is_initialized` — before the bug-fix round that added the
- * title field, the buyer-identity checks, and the one-bid-then-revise-only
- * guard. That old contract's bytecode never gained those fields, so pointing
- * this constant at it would make `readRfqState` decode a `title`/`buyer_key`
- * that doesn't exist on-chain and fail. Deploy a fresh RFQ via "Post New RFQ"
- * and set this to the new address.
+ * Empty for now, for the second time running. The candidate address
+ * (3c0e9d4f...) was deployed against `open_rfq(title, budget, unit)` — 3
+ * arguments, no `closes_at` — one round before this file's deadline feature
+ * added a 4th parameter (`deadline_at`) to that same circuit and a new
+ * `closes_at` ledger field. Hardcoding that address now would reproduce the
+ * exact bug this comment already describes happening once before with
+ * 56e3132c...: "Open RFQ" would send 4 arguments to a circuit deployed with
+ * 3, and `readRfqState` would try to decode a `closes_at` field that
+ * doesn't exist on that contract's ledger. Deploy a fresh RFQ via
+ * "Post New RFQ" against the current contract and set this to that address.
  */
 const DEFAULT_CONTRACT_ADDRESS = '';
 
@@ -51,9 +54,40 @@ interface Props {
   connectedAPI: ConnectedAPI;
 }
 
+/**
+ * Unwraps an error's `.cause` chain and returns the deepest non-empty
+ * message it can find.
+ *
+ * midnight-js wraps failures from deep inside the submit path in a generic
+ * outer error — e.g. "Unexpected error submitting scoped transaction
+ * '<unnamed>': Error" — where the trailing "Error" is just
+ * `String(innerError)` on an Error whose own `.message` is empty. The real
+ * cause (a wallet rejection, a balancing failure, a stale proving key
+ * mismatch, etc.) is attached as `.cause` on the thrown error, one or more
+ * levels down, but was never being read — the UI showed the outer wrapper
+ * text verbatim, which is close to meaningless to whoever hits it.
+ */
+function deepestErrorMessage(e: any): string {
+  let current = e;
+  let best = '';
+  for (let depth = 0; depth < 6 && current; depth++) {
+    const msg = typeof current?.message === 'string' ? current.message.trim() : '';
+    // Prefer a message that isn't just "Error" and isn't empty — those carry
+    // no information beyond "something failed".
+    if (msg && msg !== 'Error') best = msg;
+    current = current?.cause;
+  }
+  return best || String(e?.message ?? e ?? 'Unknown error');
+}
+
 /** Maps raw SDK/wallet errors onto messages a participant can act on. */
 function friendlyError(e: any): string {
-  const raw = String(e?.message ?? e ?? 'Unknown error');
+  // Full error (with its cause chain) always goes to devtools — the raw
+  // shape is often more diagnostic than any text this function can produce,
+  // especially for wallet-side failures this app has no visibility into.
+  console.error('SealedQuote transaction failed:', e);
+
+  const raw = deepestErrorMessage(e);
   if (/not enough dust/i.test(raw)) {
     return 'Not enough tDUST to pay the transaction fee. Open your wallet, generate tDUST, then try again.';
   }
@@ -69,6 +103,7 @@ function friendlyError(e: any): string {
   }
   if (/rfq is not open/i.test(raw)) return 'This RFQ is not accepting bids right now.';
   if (/rfq is already closed/i.test(raw)) return 'This RFQ is already closed.';
+  if (/bidding deadline.*has passed/i.test(raw)) return 'The bidding deadline for this RFQ has passed.';
   // The revision circuit's two asserts, translated. Note neither message can
   // echo the amounts involved — they're private, and the UI never learns them.
   if (/strictly lower/i.test(raw)) {
@@ -90,6 +125,9 @@ function friendlyError(e: any): string {
     return 'Only the wallet that opened this RFQ can close it.';
   }
   if (/budget must be positive|price must be positive/i.test(raw)) return raw;
+  if (/^unexpected error (submitting|executing) scoped transaction/i.test(raw) || raw === 'Error') {
+    return `${raw} — the underlying cause is logged in your browser console (check devtools). Common causes: the wallet rejected or couldn't build the transaction, the contract's deployed bytecode doesn't match this frontend's compiled contract, or the proof server rejected the proof.`;
+  }
   return raw;
 }
 
@@ -107,6 +145,9 @@ export function RfqCard({ connectedAPI }: Props) {
   const [titleInput, setTitleInput] = useState('');
   const [budgetInput, setBudgetInput] = useState('1000');
   const [unitInput, setUnitInput] = useState('USD');
+  // Hours, not seconds, in the UI — converted to seconds when calling
+  // openRfq. Empty string means "no deadline".
+  const [durationHoursInput, setDurationHoursInput] = useState('');
   const [priceInput, setPriceInput] = useState('');
   const [revisedPriceInput, setRevisedPriceInput] = useState('');
 
@@ -169,6 +210,7 @@ export function RfqCard({ connectedAPI }: Props) {
         revisionCount: 0n,
         isInitialized: false,
         isOpen: false,
+        closesAt: 0n,
         buyerKeyHex: '',
       });
       // A freshly deployed RFQ can't have a remembered bid yet, and whoever
@@ -258,12 +300,18 @@ export function RfqCard({ connectedAPI }: Props) {
       setError('Enter a unit for the budget (e.g. USD, USDC, tDUST).');
       return;
     }
+    const durationHours = durationHoursInput.trim();
+    if (durationHours && (Number.isNaN(Number(durationHours)) || Number(durationHours) <= 0)) {
+      setError('Bidding duration must be a positive number of hours, or left blank for no deadline.');
+      return;
+    }
+    const durationSeconds = durationHours ? BigInt(Math.round(Number(durationHours) * 3600)) : 0n;
     setError(null);
     setTxStatus('proving');
     setLastAction('open');
     setTxId(null);
     try {
-      const result = await openRfq(deployedContract, title, budget, unit);
+      const result = await openRfq(deployedContract, title, budget, unit, durationSeconds);
       setTxId(result.txId);
       setTxStatus('confirmed');
       if (contractAddress) await refresh(contractAddress);
@@ -442,9 +490,23 @@ export function RfqCard({ connectedAPI }: Props) {
 
       <section className="section">
         <div className="section-head">
-          <h2>{rfq?.isOpen ? 'Open for bids' : rfq?.isInitialized ? 'Closed' : 'Not opened yet'}</h2>
-          <span className={`badge ${rfq?.isOpen ? '' : 'badge-muted'}`}>
-            {rfq?.isOpen ? 'Open' : rfq?.isInitialized ? 'Closed' : 'Draft'}
+          <h2>
+            {!rfq?.isInitialized
+              ? 'Not opened yet'
+              : rfq.isOpen && isPastDeadline(rfq)
+                ? 'Deadline passed'
+                : rfq.isOpen
+                  ? 'Open for bids'
+                  : 'Closed'}
+          </h2>
+          <span className={`badge ${rfq?.isOpen && !isPastDeadline(rfq ?? { closesAt: 0n }) ? '' : 'badge-muted'}`}>
+            {!rfq?.isInitialized
+              ? 'Draft'
+              : rfq.isOpen && isPastDeadline(rfq)
+                ? 'Deadline passed'
+                : rfq.isOpen
+                  ? 'Open'
+                  : 'Closed'}
           </span>
         </div>
 
@@ -453,6 +515,16 @@ export function RfqCard({ connectedAPI }: Props) {
           <dd className="mono break" title={contractAddress ?? ''}>
             {contractAddress}
           </dd>
+          {rfq?.isInitialized && (
+            <>
+              <dt>Bidding deadline</dt>
+              <dd>
+                {rfq.closesAt === 0n
+                  ? 'None set — open until the buyer closes it manually'
+                  : `${new Date(Number(rfq.closesAt) * 1000).toLocaleString()}${isPastDeadline(rfq) ? ' (passed)' : ''}`}
+              </dd>
+            </>
+          )}
           <dt>Your role</dt>
           <dd>
             {!rfq?.isInitialized
@@ -516,6 +588,19 @@ export function RfqCard({ connectedAPI }: Props) {
                 aria-label="Budget unit"
                 style={{ maxWidth: '9rem' }}
               />
+            </div>
+            <div className="join-inputs" style={{ marginTop: '0.5rem' }}>
+              <input
+                id="duration-input"
+                type="number"
+                min="0"
+                step="0.5"
+                value={durationHoursInput}
+                onChange={(e) => setDurationHoursInput(e.target.value)}
+                placeholder="Bidding window, in hours (blank = no deadline)"
+                className="input"
+                aria-label="Bidding duration, in hours"
+              />
               <button onClick={handleOpen} disabled={busy} className="btn btn-primary">
                 {txStatus === 'proving' && lastAction === 'open' ? (
                   <>
@@ -530,12 +615,21 @@ export function RfqCard({ connectedAPI }: Props) {
               The title and unit are labels for humans, not cryptographic guarantees — the contract only compares
               numbers, it does not move, hold, or verify any currency. Once opened, these terms are locked: this
               RFQ can never be reopened to change them. Suppliers should confirm the unit with you off-chain
-              before bidding.
+              before bidding. If you set a bidding window, it's enforced by the chain's own clock — once it
+              passes, no more bids or revisions can land, with or without you calling "Close RFQ". Leave it blank
+              to keep bidding open until you close it manually.
             </p>
           </div>
         )}
 
-        {isSupplierHere && rfq.isOpen && !hasPrevious && (
+        {rfq?.isInitialized && rfq.isOpen && isPastDeadline(rfq) && (
+          <p className="hint" role="status">
+            This RFQ's bidding deadline has passed. No further bids or revisions can be submitted — only "Close
+            RFQ" (buyer) or Refresh are available.
+          </p>
+        )}
+
+        {isSupplierHere && rfq.isOpen && !isPastDeadline(rfq) && !hasPrevious && (
           <div className="rfq-panel">
             <label htmlFor="price-input" className="label">
               Supplier: submit a sealed bid{rfq.unitLabel && ` (in ${rfq.unitLabel})`}
@@ -567,7 +661,7 @@ export function RfqCard({ connectedAPI }: Props) {
           </div>
         )}
 
-        {isSupplierHere && rfq.isOpen && hasPrevious && (
+        {isSupplierHere && rfq.isOpen && !isPastDeadline(rfq) && hasPrevious && (
           <div className="rfq-panel">
             <label htmlFor="revised-price-input" className="label">
               Supplier: revise your bid downward{rfq.unitLabel && ` (in ${rfq.unitLabel})`}

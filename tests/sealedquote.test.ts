@@ -4,7 +4,8 @@
  * Tests cover:
  *  1. Circuit logic     — open/close lifecycle, title/budget/price validation,
  *                          the single-open guard, buyer/supplier identity
- *                          checks, and the one-bid-then-revise-only rule
+ *                          checks, the one-bid-then-revise-only rule, and
+ *                          the optional bidding deadline (closes_at)
  *  2. State transitions — counts accumulate correctly across many bids
  *  3. Private state     — the supplier's own previous bid is remembered
  *                          locally via witnesses, and drives the revision
@@ -57,11 +58,12 @@ function decodeFixed(bytes: Uint8Array): string {
 const encodeUnit = (label: string) => encodeFixed(label, 16);
 const encodeTitle = (title: string) => encodeFixed(title, 32);
 
-/** The nine fields the public ledger is expected to expose — and only these. */
+/** The ten fields the public ledger is expected to expose — and only these. */
 const PUBLIC_LEDGER_FIELDS = [
   'bid_count',
   'budget_max',
   'buyer_key',
+  'closes_at',
   'is_initialized',
   'is_open',
   'qualifying_count',
@@ -88,22 +90,29 @@ function callOpen(
   contractState: any,
   privateState: any,
   budget: bigint,
-  options: { title?: string; unit?: string; asKey?: string } = {},
+  options: { title?: string; unit?: string; asKey?: string; deadlineAt?: bigint } = {},
 ) {
-  const { title = 'test RFQ', unit = 'USD', asKey = BUYER_KEY } = options;
+  const { title = 'test RFQ', unit = 'USD', asKey = BUYER_KEY, deadlineAt = 0n } = options;
   const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
-  const result = contract.circuits.open_rfq(ctx, encodeTitle(title), budget, encodeUnit(unit));
+  const result = contract.circuits.open_rfq(ctx, encodeTitle(title), budget, encodeUnit(unit), deadlineAt);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
 
+/**
+ * `time` is passed straight to createCircuitContext's `time` parameter,
+ * which is what the contract's blockTimeLt(closes_at) checks are actually
+ * evaluated against — this is how the deadline tests below simulate
+ * "before" and "after" a deadline without depending on wall-clock time.
+ */
 function callBid(
   contract: Contract<any>,
   contractState: any,
   privateState: any,
   price: bigint,
   asKey: string = SUPPLIER_KEY,
+  time?: number,
 ) {
-  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
+  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState, undefined, undefined, time);
   const result = contract.circuits.submit_bid(ctx, price);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
@@ -114,8 +123,9 @@ function callRevised(
   privateState: any,
   price: bigint,
   asKey: string = SUPPLIER_KEY,
+  time?: number,
 ) {
-  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
+  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState, undefined, undefined, time);
   const result = contract.circuits.submit_revised_bid(ctx, price);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
@@ -316,6 +326,70 @@ describe('Sealed Quote RFQ Contract', () => {
         const bid1 = callBid(contract, opened.chargedState, opened.privateState, 900n, SUPPLIER_KEY);
         const bid2 = callBid(contract, bid1.chargedState, emptyPrivateState, 800n, OTHER_SUPPLIER_KEY);
         expect(readLedger(bid2.chargedState).bid_count).toBe(2n);
+      });
+    });
+
+    describe('Bidding deadline', () => {
+      it('defaults to no deadline (closes_at = 0) when none is given', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n);
+        expect(readLedger(opened.chargedState).closes_at).toBe(0n);
+      });
+
+      it('stores the given absolute deadline', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n, { deadlineAt: 1000n });
+        expect(readLedger(opened.chargedState).closes_at).toBe(1000n);
+      });
+
+      it('accepts a bid submitted before the deadline', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n, { deadlineAt: 1000n });
+        const bid = callBid(contract, opened.chargedState, opened.privateState, 500n, SUPPLIER_KEY, 500);
+        expect(readLedger(bid.chargedState).bid_count).toBe(1n);
+      });
+
+      it('rejects a bid submitted after the deadline, even though is_open is still true', () => {
+        // Bug this covers: the deadline is enforced independently of
+        // is_open — a buyer forgetting (or being unable) to call close_rfq
+        // must not leave the RFQ bid-able forever.
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n, { deadlineAt: 1000n });
+        expect(readLedger(opened.chargedState).is_open).toBe(true);
+        expect(() =>
+          callBid(contract, opened.chargedState, opened.privateState, 500n, SUPPLIER_KEY, 1500),
+        ).toThrow(/deadline.*has passed/);
+      });
+
+      it('rejects a revision submitted after the deadline', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n, { deadlineAt: 1000n });
+        const bid = callBid(contract, opened.chargedState, opened.privateState, 900n, SUPPLIER_KEY, 500);
+        expect(() =>
+          callRevised(contract, bid.chargedState, bid.privateState, 800n, SUPPLIER_KEY, 1500),
+        ).toThrow(/deadline.*has passed/);
+      });
+
+      it('a bid at exactly the deadline instant is rejected (deadline is exclusive)', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n, { deadlineAt: 1000n });
+        expect(() =>
+          callBid(contract, opened.chargedState, opened.privateState, 500n, SUPPLIER_KEY, 1000),
+        ).toThrow(/deadline.*has passed/);
+      });
+
+      it('with no deadline set, a bid succeeds regardless of how far in the future the block time is', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n); // no deadlineAt -> 0n
+        const bid = callBid(contract, opened.chargedState, opened.privateState, 500n, SUPPLIER_KEY, 999_999_999);
+        expect(readLedger(bid.chargedState).bid_count).toBe(1n);
+      });
+
+      it('the buyer can still close_rfq manually before a set deadline arrives', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n, { deadlineAt: 999_999n });
+        const closed = callClose(contract, opened.chargedState, opened.privateState);
+        expect(readLedger(closed.chargedState).is_open).toBe(false);
       });
     });
   });

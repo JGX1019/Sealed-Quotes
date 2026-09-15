@@ -10,7 +10,8 @@ export type ImpureCircuits<PS> = {
   open_rfq(context: __compactRuntime.CircuitContext<PS>,
            rfq_title_0: Uint8Array,
            budget_0: bigint,
-           unit_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+           unit_0: Uint8Array,
+           deadline_at_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
                      price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
@@ -21,7 +22,8 @@ export type ProvableCircuits<PS> = {
   open_rfq(context: __compactRuntime.CircuitContext<PS>,
            rfq_title_0: Uint8Array,
            budget_0: bigint,
-           unit_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+           unit_0: Uint8Array,
+           deadline_at_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
                      price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
@@ -35,7 +37,8 @@ export type Circuits<PS> = {
   open_rfq(context: __compactRuntime.CircuitContext<PS>,
            rfq_title_0: Uint8Array,
            budget_0: bigint,
-           unit_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
+           unit_0: Uint8Array,
+           deadline_at_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
                      price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
@@ -49,6 +52,7 @@ export type Ledger = {
   readonly unit_label: Uint8Array;
   readonly is_initialized: boolean;
   readonly is_open: boolean;
+  readonly closes_at: bigint;
   readonly bid_count: bigint;
   readonly qualifying_count: bigint;
   readonly revision_count: bigint;

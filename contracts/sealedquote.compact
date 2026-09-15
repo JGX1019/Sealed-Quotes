@@ -48,6 +48,12 @@
  *   - is_initialized: whether open_rfq has ever been called on this
  *     contract. Separate from is_open so a buyer cannot call open_rfq a
  *     second time to silently change the budget after bids exist.
+ *   - closes_at: an optional absolute deadline (Unix seconds) past which no
+ *     bid or revision can be submitted, regardless of is_open. 0 means "no
+ *     deadline — open until the buyer manually calls close_rfq". Enforced
+ *     with blockTimeLt(), a Compact builtin backed by the block's own
+ *     timestamp — not something either party can fake by lying about their
+ *     local clock. See "On bidding deadlines" below.
  *   - bid_count: total number of sealed bids submitted.
  *   - qualifying_count: how many of those bids were at or under budget.
  *   - revision_count: how many bids were verified price improvements on
@@ -106,6 +112,22 @@
  *   it's honest to say the rule holds only as long as a supplier doesn't
  *   deliberately wipe their own state to get around it.
  *
+ * ── On bidding deadlines ─────────────────────────────────────────────────
+ *   A buyer can optionally set `duration_seconds` in `open_rfq`. If nonzero,
+ *   `closes_at` is stored as an absolute Unix timestamp (the buyer's client
+ *   computes "now + duration_seconds" and passes that in — Compact has no
+ *   `now()` builtin, only comparison predicates against the block's own
+ *   time, so the absolute deadline has to be supplied and then checked).
+ *   `submit_bid` and `submit_revised_bid` both assert
+ *   `closes_at == 0 || blockTimeLt(closes_at)`, so once the deadline passes,
+ *   every bid and revision is rejected automatically — no transaction from
+ *   the buyer required. `blockTimeLt` is checked against the block's own
+ *   timestamp at execution time, not a value either party supplies, so a
+ *   supplier or buyer lying about their local clock cannot move it. The
+ *   buyer can still call `close_rfq` early regardless of whether a deadline
+ *   is set — a deadline caps how long bidding can run, it doesn't replace
+ *   manual closing.
+ *
  * ── Why the winning price isn't settled on-chain here ───────────────────
  *   Trustlessly picking "the lowest of N sealed bids" on-chain requires
  *   comparing every bid against every other bid without ever revealing
@@ -138,6 +160,9 @@ export ledger unit_label: Bytes<16>;
 // after bids already exist against the original terms.
 export ledger is_initialized: Boolean;
 export ledger is_open: Boolean;
+// Optional absolute deadline (Unix seconds). 0 = no deadline, bidding stays
+// open until close_rfq. See the file header, "On bidding deadlines".
+export ledger closes_at: Uint<64>;
 export ledger bid_count: Counter;
 export ledger qualifying_count: Counter;
 export ledger revision_count: Counter;
@@ -157,13 +182,19 @@ witness remember_bid(price: Uint<64>): [];
 // number. ownPublicKey() is captured here as buyer_key so submit_bid and
 // close_rfq can check against it later; see the file header for what that
 // check does and doesn't guarantee.
-export circuit open_rfq(rfq_title: Bytes<32>, budget: Uint<64>, unit: Bytes<16>): [] {
+// `deadline_at` is an absolute Unix-seconds timestamp, or 0 for no deadline.
+// It is the caller's client that computes "now + duration" — Compact has no
+// now() builtin — but the resulting number is checked against the block's
+// own timestamp at bid time via blockTimeLt(), which neither party
+// controls. See the file header, "On bidding deadlines".
+export circuit open_rfq(rfq_title: Bytes<32>, budget: Uint<64>, unit: Bytes<16>, deadline_at: Uint<64>): [] {
   assert(!is_initialized, "this RFQ has already been opened and cannot be reopened");
   assert(budget > 0, "budget must be positive");
   buyer_key = disclose(ownPublicKey());
   title = disclose(rfq_title);
   budget_max = disclose(budget);
   unit_label = disclose(unit);
+  closes_at = disclose(deadline_at);
   is_initialized = disclose(true);
   is_open = disclose(true);
 }
@@ -177,7 +208,9 @@ export circuit open_rfq(rfq_title: Bytes<32>, budget: Uint<64>, unit: Bytes<16>)
 // The price itself is never assigned to public state anywhere in this
 // circuit, so it never becomes disclosable.
 //
-// Two guards beyond the original design:
+// Guards beyond the base design:
+//   - closes_at == 0 || blockTimeLt(closes_at) stops any bid past the
+//     buyer's optional deadline, checked against the block's own clock.
 //   - ownPublicKey() != buyer_key stops the buyer bidding on their own RFQ.
 //   - local_last_bid() == 0 stops a supplier calling submit_bid a second
 //     time to bypass submit_revised_bid's "strictly lower" rule — every
@@ -189,6 +222,7 @@ export circuit open_rfq(rfq_title: Bytes<32>, budget: Uint<64>, unit: Bytes<16>)
 // is local: it does not touch the transaction or the public ledger.
 export circuit submit_bid(price: Uint<64>): [] {
   assert(is_open, "RFQ is not open for bids");
+  assert(closes_at == 0 || blockTimeLt(closes_at), "the bidding deadline for this RFQ has passed");
   assert(ownPublicKey() != buyer_key, "the buyer cannot bid on their own RFQ");
   assert(local_last_bid() == 0, "you already have a bid on this RFQ — use submit_revised_bid to lower it");
   assert(price > 0, "price must be positive");
@@ -217,6 +251,7 @@ export circuit submit_bid(price: Uint<64>): [] {
 // nonzero last_bid to revise from.
 export circuit submit_revised_bid(price: Uint<64>): [] {
   assert(is_open, "RFQ is not open for bids");
+  assert(closes_at == 0 || blockTimeLt(closes_at), "the bidding deadline for this RFQ has passed");
   assert(price > 0, "price must be positive");
 
   const previous = local_last_bid();

@@ -28,6 +28,13 @@
             "type-name": "Bytes",
             "length": 16
           }
+        },
+        {
+          "name": "deadline_at",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
         }
       ],
       "result-type": {
@@ -186,20 +193,30 @@
       }
     },
     {
-      "name": "bid_count",
+      "name": "closes_at",
       "index": 6,
       "exported": true,
-      "storage": "Counter"
+      "storage": "Cell",
+      "type": {
+        "type-name": "Uint",
+        "maxval": 18446744073709551615
+      }
     },
     {
-      "name": "qualifying_count",
+      "name": "bid_count",
       "index": 7,
       "exported": true,
       "storage": "Counter"
     },
     {
-      "name": "revision_count",
+      "name": "qualifying_count",
       "index": 8,
+      "exported": true,
+      "storage": "Counter"
+    },
+    {
+      "name": "revision_count",
+      "index": 9,
       "exported": true,
       "storage": "Counter"
     }
