@@ -7,7 +7,10 @@ export type Witnesses<PS> = {
 }
 
 export type ImpureCircuits<PS> = {
-  open_rfq(context: __compactRuntime.CircuitContext<PS>, budget_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  open_rfq(context: __compactRuntime.CircuitContext<PS>,
+           rfq_title_0: Uint8Array,
+           budget_0: bigint,
+           unit_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
                      price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
@@ -15,7 +18,10 @@ export type ImpureCircuits<PS> = {
 }
 
 export type ProvableCircuits<PS> = {
-  open_rfq(context: __compactRuntime.CircuitContext<PS>, budget_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  open_rfq(context: __compactRuntime.CircuitContext<PS>,
+           rfq_title_0: Uint8Array,
+           budget_0: bigint,
+           unit_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
                      price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
@@ -26,7 +32,10 @@ export type PureCircuits = {
 }
 
 export type Circuits<PS> = {
-  open_rfq(context: __compactRuntime.CircuitContext<PS>, budget_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+  open_rfq(context: __compactRuntime.CircuitContext<PS>,
+           rfq_title_0: Uint8Array,
+           budget_0: bigint,
+           unit_0: Uint8Array): __compactRuntime.CircuitResults<PS, []>;
   submit_bid(context: __compactRuntime.CircuitContext<PS>, price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
   submit_revised_bid(context: __compactRuntime.CircuitContext<PS>,
                      price_0: bigint): __compactRuntime.CircuitResults<PS, []>;
@@ -34,11 +43,15 @@ export type Circuits<PS> = {
 }
 
 export type Ledger = {
+  readonly buyer_key: { bytes: Uint8Array };
+  readonly title: Uint8Array;
   readonly budget_max: bigint;
+  readonly unit_label: Uint8Array;
+  readonly is_initialized: boolean;
+  readonly is_open: boolean;
   readonly bid_count: bigint;
   readonly qualifying_count: bigint;
   readonly revision_count: bigint;
-  readonly is_open: boolean;
 }
 
 export type ContractReferenceLocations = any;

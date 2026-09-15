@@ -14,6 +14,7 @@ import {
   closeRfq,
   deployRfq,
   hasPreviousBid,
+  isBuyer,
   joinRfq,
   openRfq,
   readRfqState,
@@ -34,8 +35,17 @@ type LastAction = 'open' | 'bid' | 'revise' | 'close';
  * join field still accepts any other address, so this default doesn't limit
  * what the app can do — it only removes the friction of a blank first
  * screen.
+ *
+ * Empty for now: the previous default (56e3132c...) was deployed against an
+ * older circuit shape — `open_rfq(budget, unit)` with no title, no
+ * `buyer_key`, no `is_initialized` — before the bug-fix round that added the
+ * title field, the buyer-identity checks, and the one-bid-then-revise-only
+ * guard. That old contract's bytecode never gained those fields, so pointing
+ * this constant at it would make `readRfqState` decode a `title`/`buyer_key`
+ * that doesn't exist on-chain and fail. Deploy a fresh RFQ via "Post New RFQ"
+ * and set this to the new address.
  */
-const DEFAULT_CONTRACT_ADDRESS = '56e3132cde0d680024483bd073c055e1e0c88789b9f0011f759c50c991044490';
+const DEFAULT_CONTRACT_ADDRESS = '';
 
 interface Props {
   connectedAPI: ConnectedAPI;
@@ -67,6 +77,18 @@ function friendlyError(e: any): string {
   if (/no earlier bid/i.test(raw)) {
     return 'No earlier bid found in this browser for this RFQ. Submit a first sealed bid before revising.';
   }
+  if (/the buyer cannot bid/i.test(raw)) {
+    return 'The wallet that opened this RFQ cannot also bid on it.';
+  }
+  if (/already have a bid/i.test(raw)) {
+    return "You've already submitted a bid on this RFQ. Use \"Submit Revised Bid\" to lower it.";
+  }
+  if (/already been opened/i.test(raw)) {
+    return 'This RFQ has already been opened and its terms cannot be changed.';
+  }
+  if (/only the buyer.*may close/i.test(raw)) {
+    return 'Only the wallet that opened this RFQ can close it.';
+  }
   if (/budget must be positive|price must be positive/i.test(raw)) return raw;
   return raw;
 }
@@ -82,7 +104,9 @@ export function RfqCard({ connectedAPI }: Props) {
   const [deployedContract, setDeployedContract] = useState<any>(null);
   const [rfq, setRfq] = useState<RfqState | null>(null);
 
+  const [titleInput, setTitleInput] = useState('');
   const [budgetInput, setBudgetInput] = useState('1000');
+  const [unitInput, setUnitInput] = useState('USD');
   const [priceInput, setPriceInput] = useState('');
   const [revisedPriceInput, setRevisedPriceInput] = useState('');
 
@@ -93,6 +117,16 @@ export function RfqCard({ connectedAPI }: Props) {
    * without disclosing either number.
    */
   const [hasPrevious, setHasPrevious] = useState(false);
+
+  /**
+   * Whether the connected wallet is the buyer who opened this RFQ. Drives
+   * which panels the UI offers — the buyer sees no bid/revise forms (the
+   * contract would reject both from them), everyone else doesn't see the
+   * buyer's open form once it's already open, and only the buyer sees
+   * "Close RFQ". This mirrors, but does not replace, the contract's own
+   * ownPublicKey() checks — see isBuyer's docstring in api/contract.ts.
+   */
+  const [amBuyer, setAmBuyer] = useState(false);
 
   const [txStatus, setTxStatus] = useState<TxStatus>('idle');
   const [lastAction, setLastAction] = useState<LastAction | null>(null);
@@ -109,8 +143,10 @@ export function RfqCard({ connectedAPI }: Props) {
 
   const refresh = async (address: string) => {
     try {
-      setRfq(await readRfqState(connectedAPI, address));
+      const state = await readRfqState(connectedAPI, address);
+      setRfq(state);
       setHasPrevious(await hasPreviousBid(connectedAPI, address));
+      setAmBuyer(state?.isInitialized ? await isBuyer(connectedAPI, state.buyerKeyHex) : false);
     } catch (e) {
       setError(friendlyError(e));
     }
@@ -124,9 +160,23 @@ export function RfqCard({ connectedAPI }: Props) {
       const address = contract.deployTxData.public.contractAddress;
       setDeployedContract(contract);
       setContractAddress(address);
-      setRfq({ budgetMax: 0n, bidCount: 0n, qualifyingCount: 0n, revisionCount: 0n, isOpen: false });
-      // A freshly deployed RFQ can't have a remembered bid yet.
+      setRfq({
+        title: '',
+        budgetMax: 0n,
+        unitLabel: '',
+        bidCount: 0n,
+        qualifyingCount: 0n,
+        revisionCount: 0n,
+        isInitialized: false,
+        isOpen: false,
+        buyerKeyHex: '',
+      });
+      // A freshly deployed RFQ can't have a remembered bid yet, and whoever
+      // deploys it is the buyer by definition — open_rfq hasn't run yet, but
+      // this browser is the only one that can run it (the buyer form only
+      // renders pre-open, and after open the deployer's key becomes buyer_key).
       setHasPrevious(false);
+      setAmBuyer(true);
       setTxStatus('idle');
     } catch (e) {
       setTxStatus('failed');
@@ -178,6 +228,12 @@ export function RfqCard({ connectedAPI }: Props) {
   // per connection; posting a new RFQ or joining a different one afterwards
   // simply replaces `deployedContract`, so this never fights a manual action.
   useEffect(() => {
+    if (!DEFAULT_CONTRACT_ADDRESS) {
+      // No default configured — go straight to the post/join screen instead
+      // of trying to join an empty address.
+      setAutoLoading(false);
+      return;
+    }
     setAddressInput(DEFAULT_CONTRACT_ADDRESS);
     void joinAddress(DEFAULT_CONTRACT_ADDRESS, { silent: true });
     // connectedAPI changes when the wallet (re)connects — re-attempt the
@@ -187,9 +243,19 @@ export function RfqCard({ connectedAPI }: Props) {
 
   const handleOpen = async () => {
     if (!deployedContract) return;
+    const title = titleInput.trim();
+    if (!title) {
+      setError('Enter what this budget is for (e.g. "40 office chairs").');
+      return;
+    }
     const budget = BigInt(budgetInput || '0');
     if (budget <= 0n) {
       setError('Budget must be a positive number.');
+      return;
+    }
+    const unit = unitInput.trim();
+    if (!unit) {
+      setError('Enter a unit for the budget (e.g. USD, USDC, tDUST).');
       return;
     }
     setError(null);
@@ -197,7 +263,7 @@ export function RfqCard({ connectedAPI }: Props) {
     setLastAction('open');
     setTxId(null);
     try {
-      const result = await openRfq(deployedContract, budget);
+      const result = await openRfq(deployedContract, title, budget, unit);
       setTxId(result.txId);
       setTxStatus('confirmed');
       if (contractAddress) await refresh(contractAddress);
@@ -331,13 +397,31 @@ export function RfqCard({ connectedAPI }: Props) {
     );
   }
 
+  // The buyer's open form and a supplier's bid/revise forms are mutually
+  // exclusive. amBuyer only means anything once rfq.isInitialized (before
+  // that, "buyer" hasn't been decided by the contract yet — see handleOpen).
+  const isBuyerHere = rfq?.isInitialized === true && amBuyer;
+  const isSupplierHere = rfq?.isInitialized === true && !amBuyer;
+
   return (
     <>
       <div className="stats">
         <div className="stat">
           <span className="label">Budget</span>
-          <p className="stat-value">{rfq && rfq.budgetMax > 0n ? rfq.budgetMax.toString() : '—'}</p>
-          <p className="stat-note">Buyer's published ceiling</p>
+          <p className="stat-value">
+            {rfq && rfq.isInitialized ? rfq.budgetMax.toString() : '—'}
+            {rfq && rfq.isInitialized && rfq.unitLabel && <span className="stat-unit"> {rfq.unitLabel}</span>}
+          </p>
+          <p className="stat-note">
+            {rfq && rfq.isInitialized ? (
+              <>
+                For: <strong>{rfq.title || '(untitled)'}</strong> — unit is display-only, not enforced by the
+                contract
+              </>
+            ) : (
+              "Buyer's published ceiling"
+            )}
+          </p>
         </div>
         <div className="stat">
           <span className="label">Bids</span>
@@ -358,9 +442,9 @@ export function RfqCard({ connectedAPI }: Props) {
 
       <section className="section">
         <div className="section-head">
-          <h2>{rfq?.isOpen ? 'Open for bids' : rfq && rfq.budgetMax > 0n ? 'Closed' : 'Not opened yet'}</h2>
+          <h2>{rfq?.isOpen ? 'Open for bids' : rfq?.isInitialized ? 'Closed' : 'Not opened yet'}</h2>
           <span className={`badge ${rfq?.isOpen ? '' : 'badge-muted'}`}>
-            {rfq?.isOpen ? 'Open' : rfq && rfq.budgetMax > 0n ? 'Closed' : 'Draft'}
+            {rfq?.isOpen ? 'Open' : rfq?.isInitialized ? 'Closed' : 'Draft'}
           </span>
         </div>
 
@@ -369,24 +453,48 @@ export function RfqCard({ connectedAPI }: Props) {
           <dd className="mono break" title={contractAddress ?? ''}>
             {contractAddress}
           </dd>
-          <dt>Your private state</dt>
+          <dt>Your role</dt>
           <dd>
-            {hasPrevious ? (
-              <>
-                Previous bid remembered on this device
-                <span className="privacy-label"> (amount never shown, never sent on-chain)</span>
-              </>
-            ) : (
-              'No bid remembered on this device yet'
-            )}
+            {!rfq?.isInitialized
+              ? 'Not yet decided — whoever opens this RFQ becomes its buyer'
+              : isBuyerHere
+                ? 'Buyer — you opened this RFQ, so you cannot bid on it'
+                : 'Supplier — you may submit or revise a sealed bid'}
           </dd>
+          {isSupplierHere && (
+            <>
+              <dt>Your private state</dt>
+              <dd>
+                {hasPrevious ? (
+                  <>
+                    Previous bid remembered on this device
+                    <span className="privacy-label"> (amount never shown, never sent on-chain)</span>
+                  </>
+                ) : (
+                  'No bid remembered on this device yet'
+                )}
+              </dd>
+            </>
+          )}
         </dl>
 
-        {(!rfq || rfq.budgetMax === 0n) && (
+        {!rfq?.isInitialized && (
           <div className="rfq-panel">
-            <label htmlFor="budget-input" className="label">
-              Buyer: set budget ceiling &amp; open for bids
+            <label htmlFor="title-input" className="label">
+              Buyer: name what this budget is for &amp; open for bids
             </label>
+            <div className="join-inputs" style={{ marginTop: '0.5rem' }}>
+              <input
+                id="title-input"
+                type="text"
+                maxLength={32}
+                value={titleInput}
+                onChange={(e) => setTitleInput(e.target.value)}
+                placeholder="e.g. 40 office chairs"
+                className="input"
+                aria-label="RFQ title"
+              />
+            </div>
             <div className="join-inputs" style={{ marginTop: '0.5rem' }}>
               <input
                 id="budget-input"
@@ -395,6 +503,18 @@ export function RfqCard({ connectedAPI }: Props) {
                 value={budgetInput}
                 onChange={(e) => setBudgetInput(e.target.value)}
                 className="input"
+                aria-label="Budget amount"
+              />
+              <input
+                id="unit-input"
+                type="text"
+                maxLength={16}
+                value={unitInput}
+                onChange={(e) => setUnitInput(e.target.value)}
+                placeholder="Unit (USD, tDUST, ...)"
+                className="input"
+                aria-label="Budget unit"
+                style={{ maxWidth: '9rem' }}
               />
               <button onClick={handleOpen} disabled={busy} className="btn btn-primary">
                 {txStatus === 'proving' && lastAction === 'open' ? (
@@ -406,13 +526,19 @@ export function RfqCard({ connectedAPI }: Props) {
                 )}
               </button>
             </div>
+            <p className="privacy-label">
+              The title and unit are labels for humans, not cryptographic guarantees — the contract only compares
+              numbers, it does not move, hold, or verify any currency. Once opened, these terms are locked: this
+              RFQ can never be reopened to change them. Suppliers should confirm the unit with you off-chain
+              before bidding.
+            </p>
           </div>
         )}
 
-        {rfq && rfq.budgetMax > 0n && rfq.isOpen && (
+        {isSupplierHere && rfq.isOpen && !hasPrevious && (
           <div className="rfq-panel">
             <label htmlFor="price-input" className="label">
-              Supplier: submit a sealed bid
+              Supplier: submit a sealed bid{rfq.unitLabel && ` (in ${rfq.unitLabel})`}
             </label>
             <div className="join-inputs" style={{ marginTop: '0.5rem' }}>
               <input
@@ -421,7 +547,7 @@ export function RfqCard({ connectedAPI }: Props) {
                 min="1"
                 value={priceInput}
                 onChange={(e) => setPriceInput(e.target.value)}
-                placeholder="Your price"
+                placeholder={rfq.unitLabel ? `Your price, in ${rfq.unitLabel}` : 'Your price'}
                 className="input"
               />
               <button onClick={handleBid} disabled={busy || !priceInput} className="btn btn-primary">
@@ -436,15 +562,15 @@ export function RfqCard({ connectedAPI }: Props) {
             </div>
             <p className="privacy-label">
               Your price stays private — it never leaves your browser. Only whether you qualified is disclosed,
-              never the amount.
+              never the amount. You get one bid; after this, further changes must go through "revise downward".
             </p>
           </div>
         )}
 
-        {rfq && rfq.budgetMax > 0n && rfq.isOpen && hasPrevious && (
+        {isSupplierHere && rfq.isOpen && hasPrevious && (
           <div className="rfq-panel">
             <label htmlFor="revised-price-input" className="label">
-              Supplier: revise your bid downward
+              Supplier: revise your bid downward{rfq.unitLabel && ` (in ${rfq.unitLabel})`}
             </label>
             <div className="join-inputs" style={{ marginTop: '0.5rem' }}>
               <input
@@ -453,7 +579,7 @@ export function RfqCard({ connectedAPI }: Props) {
                 min="1"
                 value={revisedPriceInput}
                 onChange={(e) => setRevisedPriceInput(e.target.value)}
-                placeholder="Your new, lower price"
+                placeholder={rfq.unitLabel ? `Your new, lower price, in ${rfq.unitLabel}` : 'Your new, lower price'}
                 className="input"
               />
               <button
@@ -483,7 +609,7 @@ export function RfqCard({ connectedAPI }: Props) {
             <button onClick={() => contractAddress && refresh(contractAddress)} disabled={busy} className="btn btn-secondary">
               Refresh
             </button>
-            {rfq?.isOpen && (
+            {rfq?.isOpen && isBuyerHere && (
               <button onClick={handleClose} disabled={busy} className="btn btn-secondary">
                 {txStatus === 'proving' && lastAction === 'close' ? (
                   <>

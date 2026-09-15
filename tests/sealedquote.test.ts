@@ -2,7 +2,9 @@
  * sealedquote.test.ts — Tests for the Sealed Quote RFQ contract
  *
  * Tests cover:
- *  1. Circuit logic     — open/close lifecycle, bid validity, budget checks
+ *  1. Circuit logic     — open/close lifecycle, title/budget/price validation,
+ *                          the single-open guard, buyer/supplier identity
+ *                          checks, and the one-bid-then-revise-only rule
  *  2. State transitions — counts accumulate correctly across many bids
  *  3. Private state     — the supplier's own previous bid is remembered
  *                          locally via witnesses, and drives the revision
@@ -11,6 +13,12 @@
  *                          never appear in ledger state, and different
  *                          qualifying/non-qualifying prices are
  *                          indistinguishable on the public ledger
+ *
+ * Note: `title` and `unit_label` are PUBLIC display-only fields, not
+ * private ones — they carry no cryptographic role, so they're exercised in
+ * the circuit-logic tests below, not the privacy tests. `buyer_key` is also
+ * public (see the file header in sealedquote.compact, "On-chain identity
+ * checks", for what it does and doesn't guarantee).
  */
 
 import {
@@ -23,21 +31,50 @@ import { emptyPrivateState, witnesses } from '../src/api/privateState.js';
 
 const DUMMY_ADDRESS = '0'.repeat(64);
 const DUMMY_KEY = '0'.repeat(64);
+// Two distinct 64-hex-char coin public keys, standing in for a buyer's
+// wallet and a supplier's wallet. createCircuitContext's second argument
+// determines what ownPublicKey() returns inside the circuit — passing a
+// different key per call is how these tests exercise the buyer/supplier
+// identity checks without needing a real wallet.
+const BUYER_KEY = '1'.repeat(64);
+const SUPPLIER_KEY = '2'.repeat(64);
+const OTHER_SUPPLIER_KEY = '3'.repeat(64);
 
-/** The five fields the public ledger is expected to expose — and only these. */
+/** Mirrors src/api/contract.ts's encoding for fixed-width Bytes<N> ledger fields. */
+function encodeFixed(text: string, width: number): Uint8Array {
+  const encoded = new TextEncoder().encode(text);
+  const bytes = new Uint8Array(width);
+  bytes.set(encoded.subarray(0, width));
+  return bytes;
+}
+
+function decodeFixed(bytes: Uint8Array): string {
+  let end = bytes.length;
+  while (end > 0 && bytes[end - 1] === 0) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
+const encodeUnit = (label: string) => encodeFixed(label, 16);
+const encodeTitle = (title: string) => encodeFixed(title, 32);
+
+/** The nine fields the public ledger is expected to expose — and only these. */
 const PUBLIC_LEDGER_FIELDS = [
   'bid_count',
   'budget_max',
+  'buyer_key',
+  'is_initialized',
   'is_open',
   'qualifying_count',
   'revision_count',
+  'title',
+  'unit_label',
 ];
 
-function freshState() {
-  // The contract is constructed with the real witness implementations, so these
-  // tests exercise the same private-state code path the dApp uses.
+function freshState(coinPublicKey: string = BUYER_KEY) {
+  // The contract is constructed with the real witness implementations, so
+  // these tests exercise the same private-state code path the dApp uses.
   const contract = new Contract(witnesses as any);
-  const ctx = createConstructorContext(emptyPrivateState, DUMMY_ADDRESS);
+  const ctx = createConstructorContext(emptyPrivateState, coinPublicKey);
   const init = contract.initialState(ctx);
   return { contract, contractState: init.currentContractState, privateState: init.currentPrivateState };
 }
@@ -46,66 +83,124 @@ function readLedger(contractState: any) {
   return ledger(contractState.data ?? contractState);
 }
 
-function callOpen(contract: Contract<any>, contractState: any, privateState: any, budget: bigint) {
-  const ctx = createCircuitContext(DUMMY_ADDRESS, emptyZswapLocalState(DUMMY_KEY), contractState, privateState);
-  const result = contract.circuits.open_rfq(ctx, budget);
+function callOpen(
+  contract: Contract<any>,
+  contractState: any,
+  privateState: any,
+  budget: bigint,
+  options: { title?: string; unit?: string; asKey?: string } = {},
+) {
+  const { title = 'test RFQ', unit = 'USD', asKey = BUYER_KEY } = options;
+  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
+  const result = contract.circuits.open_rfq(ctx, encodeTitle(title), budget, encodeUnit(unit));
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
 
-function callBid(contract: Contract<any>, contractState: any, privateState: any, price: bigint) {
-  const ctx = createCircuitContext(DUMMY_ADDRESS, emptyZswapLocalState(DUMMY_KEY), contractState, privateState);
+function callBid(
+  contract: Contract<any>,
+  contractState: any,
+  privateState: any,
+  price: bigint,
+  asKey: string = SUPPLIER_KEY,
+) {
+  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
   const result = contract.circuits.submit_bid(ctx, price);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
 
-function callRevised(contract: Contract<any>, contractState: any, privateState: any, price: bigint) {
-  const ctx = createCircuitContext(DUMMY_ADDRESS, emptyZswapLocalState(DUMMY_KEY), contractState, privateState);
+function callRevised(
+  contract: Contract<any>,
+  contractState: any,
+  privateState: any,
+  price: bigint,
+  asKey: string = SUPPLIER_KEY,
+) {
+  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
   const result = contract.circuits.submit_revised_bid(ctx, price);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
 
-function callClose(contract: Contract<any>, contractState: any, privateState: any) {
-  const ctx = createCircuitContext(DUMMY_ADDRESS, emptyZswapLocalState(DUMMY_KEY), contractState, privateState);
+function callClose(contract: Contract<any>, contractState: any, privateState: any, asKey: string = BUYER_KEY) {
+  const ctx = createCircuitContext(DUMMY_ADDRESS, asKey, contractState, privateState);
   const result = contract.circuits.close_rfq(ctx);
   return { chargedState: result.context.currentQueryContext.state, privateState: result.context.currentPrivateState };
 }
 
-/** Opens an RFQ at the given budget, then submits each price in order. */
+/** Opens an RFQ (as the buyer) at the given budget, then submits each price as the default supplier, in order. */
 function openAndBid(budget: bigint, prices: bigint[]) {
   const { contract, contractState, privateState } = freshState();
   const opened = callOpen(contract, contractState, privateState, budget);
   let state: any = opened.chargedState;
+  // Each price after the first goes through submit_bid only once; the
+  // remaining prices are folded through submit_revised_bid, since submit_bid
+  // now rejects a second call from the same supplier. Tests that want a
+  // specific mix of plain bids from *different* suppliers call callBid
+  // directly with distinct keys instead of using this helper.
   let priv: any = opened.privateState;
+  let first = true;
   for (const price of prices) {
-    const r = callBid(contract, state, priv, price);
+    const r = first
+      ? callBid(contract, state, priv, price)
+      : callRevised(contract, state, priv, price);
     state = r.chargedState;
     priv = r.privateState;
+    first = false;
   }
   return { contract, state, priv };
 }
 
 describe('Sealed Quote RFQ Contract', () => {
   describe('Circuit logic', () => {
-    it('starts closed with no bids', () => {
+    it('starts uninitialized, closed, with no bids', () => {
       const { contractState } = freshState();
       const state = readLedger(contractState);
+      expect(state.is_initialized).toBe(false);
       expect(state.is_open).toBe(false);
       expect(state.bid_count).toBe(0n);
       expect(state.qualifying_count).toBe(0n);
       expect(state.revision_count).toBe(0n);
     });
 
-    it('open_rfq publishes the budget and opens bidding', () => {
+    it('open_rfq publishes the title, budget, and unit, and opens bidding', () => {
       const { contract, contractState, privateState } = freshState();
-      const r = callOpen(contract, contractState, privateState, 1000n);
+      const r = callOpen(contract, contractState, privateState, 1000n, { title: 'office chairs', unit: 'tDUST' });
       const state = readLedger(r.chargedState);
+      expect(decodeFixed(state.title)).toBe('office chairs');
       expect(state.budget_max).toBe(1000n);
+      expect(decodeFixed(state.unit_label)).toBe('tDUST');
+      expect(state.is_initialized).toBe(true);
       expect(state.is_open).toBe(true);
+    });
+
+    it('truncates a title longer than 32 bytes rather than throwing', () => {
+      const { contract, contractState, privateState } = freshState();
+      const longTitle = 'a title that is much longer than thirty two bytes for sure';
+      const r = callOpen(contract, contractState, privateState, 1000n, { title: longTitle });
+      const state = readLedger(r.chargedState);
+      expect(decodeFixed(state.title)).toBe(longTitle.slice(0, 32));
+    });
+
+    it('truncates a unit label longer than 16 bytes rather than throwing', () => {
+      const { contract, contractState, privateState } = freshState();
+      const r = callOpen(contract, contractState, privateState, 1000n, { unit: 'A very long currency name' });
+      const state = readLedger(r.chargedState);
+      expect(decodeFixed(state.unit_label)).toBe('A very long curr');
     });
 
     it('rejects a zero budget', () => {
       const { contract, contractState, privateState } = freshState();
       expect(() => callOpen(contract, contractState, privateState, 0n)).toThrow();
+    });
+
+    it('rejects opening the same RFQ a second time', () => {
+      // Bug fix: previously open_rfq had no guard, so a buyer could call it
+      // again mid-auction and silently change the budget suppliers already
+      // bid against.
+      const { contract, contractState, privateState } = freshState();
+      const opened = callOpen(contract, contractState, privateState, 1000n);
+      expect(() =>
+        callOpen(contract, opened.chargedState, opened.privateState, 5000n, { title: 'different terms' }),
+      ).toThrow(/already been opened/);
     });
 
     it('rejects a bid before the RFQ is opened', () => {
@@ -133,7 +228,7 @@ describe('Sealed Quote RFQ Contract', () => {
       expect(s.qualifying_count).toBe(0n);
     });
 
-    it('close_rfq closes an open RFQ', () => {
+    it('close_rfq closes an open RFQ when called by the buyer', () => {
       const { contract, state, priv } = openAndBid(1000n, []);
       const closed = callClose(contract, state, priv);
       expect(readLedger(closed.chargedState).is_open).toBe(false);
@@ -142,7 +237,7 @@ describe('Sealed Quote RFQ Contract', () => {
     it('rejects closing an already-closed RFQ', () => {
       const { contract, state, priv } = openAndBid(1000n, []);
       const closed = callClose(contract, state, priv);
-      expect(() => callClose(contract, closed.chargedState, closed.privateState)).toThrow();
+      expect(() => callClose(contract, closed.chargedState, closed.privateState)).toThrow(/already closed/);
     });
 
     it('rejects a bid submitted after the RFQ is closed', () => {
@@ -150,39 +245,128 @@ describe('Sealed Quote RFQ Contract', () => {
       const closed = callClose(contract, state, priv);
       expect(() => callBid(contract, closed.chargedState, closed.privateState, 500n)).toThrow();
     });
+
+    describe('Buyer / supplier identity checks', () => {
+      it('rejects the buyer bidding on their own RFQ', () => {
+        // Bug fix: previously nothing stopped the wallet that opened an RFQ
+        // from also submitting a bid on it.
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n);
+        expect(() =>
+          callBid(contract, opened.chargedState, opened.privateState, 500n, BUYER_KEY),
+        ).toThrow(/buyer cannot bid/);
+      });
+
+      it('allows a supplier who is not the buyer to bid', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n);
+        const bid = callBid(contract, opened.chargedState, opened.privateState, 500n, SUPPLIER_KEY);
+        expect(readLedger(bid.chargedState).bid_count).toBe(1n);
+      });
+
+      it('rejects close_rfq called by a non-buyer', () => {
+        // Bug fix: previously anyone at all could close anyone else's RFQ,
+        // letting a losing supplier grief the auction shut.
+        const { contract, state, priv } = openAndBid(1000n, []);
+        expect(() => callClose(contract, state, priv, SUPPLIER_KEY)).toThrow(/only the buyer/);
+      });
+
+      it('rejects close_rfq called by a different supplier than any bidder', () => {
+        const { contract, state, priv } = openAndBid(1000n, []);
+        expect(() => callClose(contract, state, priv, OTHER_SUPPLIER_KEY)).toThrow(/only the buyer/);
+      });
+    });
+
+    describe('One bid, then revise-only', () => {
+      it('rejects a second submit_bid call from the same supplier', () => {
+        // Bug fix: previously a supplier could call submit_bid repeatedly
+        // instead of submit_revised_bid, bypassing the "revisions only go
+        // down" rule entirely (they could raise their price back up, or
+        // dodge the rule for any reason).
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n);
+        const firstBid = callBid(contract, opened.chargedState, opened.privateState, 900n, SUPPLIER_KEY);
+        expect(() =>
+          callBid(contract, firstBid.chargedState, firstBid.privateState, 950n, SUPPLIER_KEY),
+        ).toThrow(/already have a bid/);
+      });
+
+      it('a second submit_bid attempt does not change public state', () => {
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n);
+        const firstBid = callBid(contract, opened.chargedState, opened.privateState, 900n, SUPPLIER_KEY);
+        const before = readLedger(firstBid.chargedState);
+        try {
+          callBid(contract, firstBid.chargedState, firstBid.privateState, 950n, SUPPLIER_KEY);
+        } catch {
+          // expected
+        }
+        // Re-read from the same pre-attempt state — a thrown circuit call
+        // must not have produced a usable state to move forward from.
+        expect(readLedger(firstBid.chargedState)).toEqual(before);
+      });
+
+      it('two different suppliers can each submit exactly one plain bid', () => {
+        // Each supplier has their own private state store in reality (private
+        // state lives per-browser) — bid2 starts from emptyPrivateState, not
+        // from bid1's, to model that correctly rather than incorrectly
+        // sharing one supplier's "have I bid" memory with another's.
+        const { contract, contractState, privateState } = freshState();
+        const opened = callOpen(contract, contractState, privateState, 1000n);
+        const bid1 = callBid(contract, opened.chargedState, opened.privateState, 900n, SUPPLIER_KEY);
+        const bid2 = callBid(contract, bid1.chargedState, emptyPrivateState, 800n, OTHER_SUPPLIER_KEY);
+        expect(readLedger(bid2.chargedState).bid_count).toBe(2n);
+      });
+    });
   });
 
   describe('State transitions', () => {
     it('counts accumulate across many bids from many suppliers', () => {
-      // budget 1000; bids: 500 (qualifies), 1500 (no), 1000 (qualifies), 999 (qualifies)
-      const { state } = openAndBid(1000n, [500n, 1500n, 1000n, 999n]);
+      // budget 1000; bids from 4 distinct suppliers: 500 (qualifies), 1500 (no),
+      // 1000 (qualifies), 999 (qualifies)
+      const { contract, contractState, privateState } = freshState();
+      const opened = callOpen(contract, contractState, privateState, 1000n);
+      let state: any = opened.chargedState;
+      const prices: [bigint, string][] = [
+        [500n, '4'.repeat(64)],
+        [1500n, '5'.repeat(64)],
+        [1000n, '6'.repeat(64)],
+        [999n, '7'.repeat(64)],
+      ];
+      for (const [price, key] of prices) {
+        // Each of these is a distinct supplier's first bid, so each starts
+        // from its own emptyPrivateState — see the note on the two-suppliers
+        // test above for why bid1.privateState must not be reused here.
+        const r = callBid(contract, state, emptyPrivateState, price, key);
+        state = r.chargedState;
+      }
       const s = readLedger(state);
       expect(s.bid_count).toBe(4n);
       expect(s.qualifying_count).toBe(3n);
     });
 
     it('handles an all-qualifying round', () => {
-      const { state } = openAndBid(1000n, [100n, 200n, 1000n]);
+      const { state } = openAndBid(1000n, [100n]);
       const s = readLedger(state);
-      expect(s.bid_count).toBe(3n);
-      expect(s.qualifying_count).toBe(3n);
+      expect(s.bid_count).toBe(1n);
+      expect(s.qualifying_count).toBe(1n);
     });
 
     it('handles an all-over-budget round', () => {
-      const { state } = openAndBid(100n, [200n, 300n, 1000n]);
+      const { state } = openAndBid(100n, [200n]);
       const s = readLedger(state);
-      expect(s.bid_count).toBe(3n);
+      expect(s.bid_count).toBe(1n);
       expect(s.qualifying_count).toBe(0n);
     });
 
     it('never lets qualifying_count exceed bid_count', () => {
-      const { state } = openAndBid(500n, [100n, 600n, 500n, 50n, 9999n]);
+      const { state } = openAndBid(500n, [600n, 500n, 50n]);
       const s = readLedger(state);
       expect(s.qualifying_count).toBeLessThanOrEqual(s.bid_count);
     });
 
-    it('budget_max stays fixed once bidding starts', () => {
-      const { state } = openAndBid(750n, [100n, 800n, 750n]);
+    it('budget_max stays fixed across a supplier revising their bid', () => {
+      const { state } = openAndBid(750n, [800n, 750n]);
       expect(readLedger(state).budget_max).toBe(750n);
     });
   });
@@ -198,7 +382,7 @@ describe('Sealed Quote RFQ Contract', () => {
       expect(priv.lastBid).toBe(640n);
     });
 
-    it('private state tracks the most recent bid across several bids', () => {
+    it('private state tracks the most recent bid across a chain of revisions', () => {
       const { priv } = openAndBid(1000n, [900n, 800n, 700n]);
       expect(priv.lastBid).toBe(700n);
     });
@@ -275,14 +459,14 @@ describe('Sealed Quote RFQ Contract', () => {
       expect(s.revision_count).toBe(1n);
     });
 
-    it('plain bids do not increment revision_count', () => {
-      const { state } = openAndBid(1000n, [900n, 800n, 700n]);
+    it('a chain of revisions does not increment revision_count on the initial bid', () => {
+      const { state } = openAndBid(1000n, [900n]);
       expect(readLedger(state).revision_count).toBe(0n);
     });
   });
 
   describe('Privacy model — private prices are never exposed', () => {
-    it('ledger exposes only the five public fields, never a price', () => {
+    it('ledger exposes only the nine public fields, never a price', () => {
       const { contractState } = freshState();
       const publicState = ledger(contractState.data);
       expect(Object.keys(publicState).sort()).toEqual(PUBLIC_LEDGER_FIELDS);
@@ -302,10 +486,10 @@ describe('Sealed Quote RFQ Contract', () => {
       expect(readLedger(slightlyOver.state)).toEqual(readLedger(wayOver.state));
     });
 
-    it('different bid sequences with the same qualify profile produce identical public state', () => {
-      // Both: 3 bids, 2 qualifying — but entirely different exact prices.
-      const roundA = openAndBid(1000n, [500n, 1500n, 1000n]);
-      const roundB = openAndBid(1000n, [999n, 2000n, 1n]);
+    it('different revision chains with the same qualify profile produce identical public state', () => {
+      // Both: 1 initial bid + 2 revisions, 2 qualifying — different exact prices throughout.
+      const roundA = openAndBid(1000n, [1500n, 1000n, 500n]);
+      const roundB = openAndBid(1000n, [2000n, 999n, 1n]);
       expect(readLedger(roundA.state)).toEqual(readLedger(roundB.state));
     });
 

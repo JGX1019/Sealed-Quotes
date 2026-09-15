@@ -9,10 +9,24 @@
       "proof": true,
       "arguments": [
         {
+          "name": "rfq_title",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        },
+        {
           "name": "budget",
           "type": {
             "type-name": "Uint",
             "maxval": 18446744073709551615
+          }
+        },
+        {
+          "name": "unit",
+          "type": {
+            "type-name": "Bytes",
+            "length": 16
           }
         }
       ],
@@ -105,8 +119,37 @@
   ],
   "ledger": [
     {
-      "name": "budget_max",
+      "name": "buyer_key",
       "index": 0,
+      "exported": true,
+      "storage": "Cell",
+      "type": {
+        "type-name": "Struct",
+        "name": "ZswapCoinPublicKey",
+        "elements": [
+          {
+            "name": "bytes",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "title",
+      "index": 1,
+      "exported": true,
+      "storage": "Cell",
+      "type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    },
+    {
+      "name": "budget_max",
+      "index": 2,
       "exported": true,
       "storage": "Cell",
       "type": {
@@ -115,31 +158,50 @@
       }
     },
     {
-      "name": "bid_count",
-      "index": 1,
-      "exported": true,
-      "storage": "Counter"
-    },
-    {
-      "name": "qualifying_count",
-      "index": 2,
-      "exported": true,
-      "storage": "Counter"
-    },
-    {
-      "name": "revision_count",
+      "name": "unit_label",
       "index": 3,
       "exported": true,
-      "storage": "Counter"
+      "storage": "Cell",
+      "type": {
+        "type-name": "Bytes",
+        "length": 16
+      }
     },
     {
-      "name": "is_open",
+      "name": "is_initialized",
       "index": 4,
       "exported": true,
       "storage": "Cell",
       "type": {
         "type-name": "Boolean"
       }
+    },
+    {
+      "name": "is_open",
+      "index": 5,
+      "exported": true,
+      "storage": "Cell",
+      "type": {
+        "type-name": "Boolean"
+      }
+    },
+    {
+      "name": "bid_count",
+      "index": 6,
+      "exported": true,
+      "storage": "Counter"
+    },
+    {
+      "name": "qualifying_count",
+      "index": 7,
+      "exported": true,
+      "storage": "Counter"
+    },
+    {
+      "name": "revision_count",
+      "index": 8,
+      "exported": true,
+      "storage": "Counter"
     }
   ]
 }

@@ -20,11 +20,53 @@ import { emptyPrivateState, PRIVATE_STATE_ID, witnesses, type SealedQuotePrivate
 const ZK_ASSETS_PATH = '/managed/sealedquote';
 
 export interface RfqState {
+  title: string;
   budgetMax: bigint;
+  unitLabel: string;
   bidCount: bigint;
   qualifyingCount: bigint;
   revisionCount: bigint;
+  isInitialized: boolean;
   isOpen: boolean;
+  /** Hex-encoded buyer coin public key, for the "is this caller the buyer?" check in the UI. */
+  buyerKeyHex: string;
+}
+
+/** Fixed width of the contract's `Bytes<N>` display-label ledger fields. */
+const UNIT_LABEL_BYTES = 16;
+const TITLE_BYTES = 32;
+
+/**
+ * Encodes display text into a fixed-width byte array the contract expects.
+ * Longer UTF-8 input is truncated to fit; shorter input is zero-padded,
+ * which decodeFixedBytes below strips back off.
+ */
+function encodeFixedBytes(text: string, width: number): Uint8Array {
+  const encoded = new TextEncoder().encode(text);
+  const bytes = new Uint8Array(width);
+  bytes.set(encoded.subarray(0, width));
+  return bytes;
+}
+
+/** Reverses encodeFixedBytes: strips the zero padding, decodes UTF-8. */
+function decodeFixedBytes(bytes: Uint8Array): string {
+  let end = bytes.length;
+  while (end > 0 && bytes[end - 1] === 0) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
+function encodeUnitLabel(label: string): Uint8Array {
+  return encodeFixedBytes(label, UNIT_LABEL_BYTES);
+}
+
+function encodeTitle(title: string): Uint8Array {
+  return encodeFixedBytes(title, TITLE_BYTES);
+}
+
+/** Hex-encodes a coin public key for equality comparison in the UI. */
+function coinPublicKeyToHex(key: { bytes: Uint8Array } | undefined | null): string {
+  if (!key?.bytes) return '';
+  return Array.from(key.bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**
@@ -112,9 +154,26 @@ export async function joinRfq(connectedAPI: ConnectedAPI, contractAddress: strin
   );
 }
 
-/** Buyer action: publishes the budget ceiling and opens the RFQ for bids. */
-export async function openRfq(deployedContract: any, budget: bigint) {
-  const result: any = await withTimeout(deployedContract.callTx.open_rfq(budget), 120_000, 'Open RFQ');
+/**
+ * Buyer action: publishes the title, budget ceiling, and unit, and opens the
+ * RFQ for bids. Can only succeed once per contract — the circuit asserts
+ * `!is_initialized`, so a second call (e.g. trying to change the budget
+ * after bids exist) fails rather than silently overwriting the terms
+ * suppliers already bid against.
+ *
+ * `title` is what the budget is for (e.g. "40 office chairs"). `unit` is a
+ * display label ("USD", "USDC", "tDUST", ...) for what `budget` and every
+ * submitted price are stated to be denominated in. Both are public,
+ * on-chain, and informational only — the contract does not move or verify
+ * any actual currency or interpret the title; see the header comment in
+ * sealedquote.compact.
+ */
+export async function openRfq(deployedContract: any, title: string, budget: bigint, unit: string) {
+  const result: any = await withTimeout(
+    deployedContract.callTx.open_rfq(encodeTitle(title), budget, encodeUnitLabel(unit)),
+    120_000,
+    'Open RFQ',
+  );
   return result.public;
 }
 
@@ -170,17 +229,45 @@ export async function hasPreviousBid(connectedAPI: ConnectedAPI, contractAddress
   return !!state && typeof state.lastBid === 'bigint' && state.lastBid > 0n;
 }
 
-/** Reads the public RFQ state (budget, bid count, qualifying count, open flag). */
+/** Reads the public RFQ state (title, budget, bid/qualifying/revision counts, open flag, buyer key). */
 export async function readRfqState(connectedAPI: ConnectedAPI, contractAddress: string): Promise<RfqState | null> {
   const providers = await buildProviders(connectedAPI);
   const state = await providers.publicDataProvider.queryContractState(contractAddress as any);
   if (!state) return null;
   const publicState = ledger((state as any).data ?? state);
   return {
+    title: decodeFixedBytes(publicState.title),
     budgetMax: publicState.budget_max,
+    unitLabel: decodeFixedBytes(publicState.unit_label),
     bidCount: publicState.bid_count,
     qualifyingCount: publicState.qualifying_count,
     revisionCount: publicState.revision_count,
+    isInitialized: publicState.is_initialized,
     isOpen: publicState.is_open,
+    buyerKeyHex: coinPublicKeyToHex(publicState.buyer_key),
   };
+}
+
+/**
+ * Whether the currently connected wallet is the buyer who opened this RFQ.
+ * Compares the wallet's own coin public key against the on-chain `buyer_key`
+ * — the same comparison the contract itself makes via `ownPublicKey()` in
+ * `submit_bid`/`close_rfq`, done here so the UI can hide actions the
+ * contract would reject anyway (e.g. showing "Submit a bid" to the buyer).
+ *
+ * This is a UI convenience, not the enforcement boundary — the contract's
+ * own `ownPublicKey()` checks are what actually stop a disallowed call. See
+ * "On-chain identity checks" in sealedquote.compact for the honest limits
+ * of that guarantee.
+ *
+ * `getCoinPublicKey()` already returns a hex string (see providers.ts,
+ * where it's set from the wallet's `shieldedCoinPublicKey`), so no Bech32m
+ * parsing is needed here — only a case-insensitive string comparison
+ * against the hex the ledger's `buyer_key` decodes to.
+ */
+export async function isBuyer(connectedAPI: ConnectedAPI, buyerKeyHex: string): Promise<boolean> {
+  if (!buyerKeyHex) return false;
+  const providers = await buildProviders(connectedAPI);
+  const ownKeyHex = providers.walletProvider.getCoinPublicKey();
+  return !!ownKeyHex && ownKeyHex.toLowerCase() === buyerKeyHex.toLowerCase();
 }

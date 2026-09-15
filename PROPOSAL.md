@@ -2,9 +2,11 @@
 
 ## What is the product, and who uses it?
 
-SealedQuote is a private RFQ (request-for-quote) marketplace. A buyer posts a request with a public budget ceiling; suppliers submit sealed bids that are checked against that budget entirely inside a zero-knowledge proof. Nobody — not the buyer, not rival suppliers, not a chain observer — ever sees an individual supplier's price. All that's public is how many bids came in, how many of them qualified, and how many were verified price improvements.
+SealedQuote is a private RFQ (request-for-quote) tool. A buyer posts a request naming what it's for, with a public budget ceiling; suppliers submit sealed bids that are checked against that budget entirely inside a zero-knowledge proof. Nobody — not the buyer, not rival suppliers, not a chain observer — ever sees an individual supplier's price. All that's public is what the RFQ is for, how many bids came in, how many of them qualified, and how many were verified price improvements.
 
-Suppliers can also revise their own bid downward — a "best and final offer" round — and prove the new bid genuinely undercuts their previous one without either number, or the size of the cut, ever becoming visible to the buyer, to rival suppliers, or to the chain.
+Suppliers can also revise their own bid downward — a "best and final offer" round — and prove the new bid genuinely undercuts their previous one without either number, or the size of the cut, ever becoming visible to the buyer, to rival suppliers, or to the chain. Every supplier gets exactly one initial bid; any change after that must go through the revision circuit, so a price only ever moves down. The buyer who opens an RFQ is barred from bidding on it.
+
+**Scope note on "marketplace":** each RFQ is its own contract deployment, shared like a link between the buyer and the suppliers they invite — there is no shared registry or browse page where suppliers discover open RFQs on their own. That's the natural next step and is discussed under Mainnet Feasibility below; what ships today is the sealed-bid mechanic for one RFQ at a time.
 
 This targets B2B procurement, where sealed bidding is standard practice but almost never actually sealed. Suppliers routinely refuse to bid their real price when they suspect a competitor can infer it from a leaked number or a chatty buyer, so RFQs regress into anchored, uncompetitive bids. SealedQuote makes "sealed" a cryptographic guarantee instead of a policy the buyer promises to follow.
 
@@ -20,14 +22,18 @@ The revision flow needs something transparent chains fundamentally can't offer: 
 
 | Data Point | Type | Disclosed To |
 |------------|------|--------------|
+| `title` — what the RFQ's budget is for | Public ledger | Everyone |
 | `budget_max` — the buyer's published ceiling | Public ledger | Everyone |
+| `unit_label` — display-only unit for the budget/prices (e.g. "USD") | Public ledger | Everyone |
+| `buyer_key` — coin public key of whoever opened the RFQ | Public ledger | Everyone |
+| `is_initialized` — whether the RFQ has been opened (locks its terms permanently) | Public ledger | Everyone |
 | `bid_count` — total sealed bids submitted | Public ledger (Counter) | Everyone |
 | `qualifying_count` — bids at or under budget | Public ledger (Counter) | Everyone |
 | `revision_count` — proven price improvements | Public ledger (Counter) | Everyone |
 | `is_open` — whether the RFQ is accepting bids | Public ledger | Everyone |
 | `price` — a supplier's exact bid | Private witness (circuit input) | No one |
 | `lastBid` — a supplier's most recent bid, persisted between transactions | Private state (supplier's own device) | No one — not even a future session on a different device |
-| ZK proof that a bid qualifies | ZK proof | Chain (verifies without reading the price) |
+| ZK proof that a bid qualifies, isn't the buyer's, and is this supplier's first | ZK proof | Chain (verifies without reading the price, and without a signature-verified identity — see Mainnet Feasibility) |
 | ZK proof that a revision undercuts the previous bid | ZK proof | Chain (verifies a relationship between two private numbers it never sees) |
 
 ## Mainnet Feasibility
@@ -36,4 +42,8 @@ Partially, with one honest and significant gap: this build does not select or se
 
 What ships today includes the single-supplier version of that same problem, solved: `submit_revised_bid` compares one supplier's new bid against their own previous bid, both private, with neither ever disclosed. That's a genuine step toward the harder N-supplier case — the private-state machinery (remembering a value, then constraining a later circuit call against it) is the same primitive a cross-supplier comparison would need, just applied to one party's bid history instead of a live set of competing bids. Extending it to "lowest across all suppliers" would mean the buyer's `close_rfq` circuit reading a private ledger of all sealed bids (each supplier's own witness-backed record) and running a private argmin over them — architecturally an extension of what's here, not a rewrite.
 
-Beyond that, getting to something a real buyer would run needs: on-chain winner selection across suppliers (the argmin circuit above, or a commit-then-selectively-reveal scheme where only the winner discloses); multiple concurrent, independently owned RFQs instead of one contract per request; a binding mechanism so a "winning" supplier can't walk away after selection; moving the private-state store off `localStorage` and onto the wallet's own encrypted storage, so a supplier's bid history survives a device change and isn't readable by another script on the same origin; and — same as every level before this one — moving proof generation off a local Docker server so a supplier can bid from a link, not a dev environment.
+There's also a genuine "is this a marketplace" gap, separate from winner selection: right now each RFQ is its own contract deployment, discovered by sharing its address like a link. There's no registry contract or browse page listing every open RFQ, so suppliers can't discover RFQs they weren't specifically pointed at. A production version needs a registry — a `Map<ContractAddress, RfqSummary>` published by a factory contract, or an off-chain indexer that watches `ContractDeploy` events for this contract's code hash — plus a frontend that lists and filters open RFQs instead of asking for a pasted address. This is additive to the current design, not a rewrite: each RFQ contract stays exactly as it is, a registry just becomes the thing suppliers browse to find one.
+
+The identity checks added in this round (barring the buyer from bidding on their own RFQ, restricting `close_rfq` to the buyer) are worth being precise about on the way to Mainnet. They use Compact's `ownPublicKey()`, which is a value the *prover* supplies when generating their own proof — not something checked against a wallet signature at the protocol level. Every real user going through this dApp is genuinely blocked, since the wallet's key is what the UI uses and there's no way to override it from the interface. But a hostile actor writing their own client could, in principle, supply a different key during proof generation. Closing that gap properly needs a commit/reveal scheme — the buyer commits to a secret at `open_rfq` time and proves knowledge of it (rather than mere equality of a public value) at `close_rfq` time. Same story for the "one bid, then revise-only" rule: it's backed by private state in `localStorage`, so a supplier who deliberately wipes their own browser storage resets their own "have I bid" memory. Neither of these is exploitable by a normal user through the app; both are worth hardening before this touches real money.
+
+Beyond that, getting to something a real buyer would run needs: on-chain winner selection across suppliers (the argmin circuit above, or a commit-then-selectively-reveal scheme where only the winner discloses); a binding mechanism so a "winning" supplier can't walk away after selection; moving the private-state store off `localStorage` and onto the wallet's own encrypted storage, so a supplier's bid history survives a device change and isn't readable by another script on the same origin; and — same as every level before this one — moving proof generation off a local Docker server so a supplier can bid from a link, not a dev environment.

@@ -180,6 +180,13 @@ body {
   margin: 0.75rem 0 0.4rem;
 }
 
+.stat-unit {
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: var(--muted);
+  letter-spacing: 0;
+}
+
 .stat-note {
   font-size: 0.72rem;
   color: var(--muted);

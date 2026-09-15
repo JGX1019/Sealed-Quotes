@@ -1,17 +1,53 @@
 /**
  * sealedquote.compact — Sealed Quote RFQ
  *
- * A buyer publishes a request-for-quote with a maximum budget. Suppliers
- * submit sealed bids: each bid is checked against the budget entirely
- * inside a zero-knowledge proof, so a supplier's exact price is never
- * written to the chain, read by the buyer, or seen by rival suppliers.
+ * A buyer publishes a request-for-quote with a title and a maximum budget.
+ * Suppliers submit sealed bids: each bid is checked against the budget
+ * entirely inside a zero-knowledge proof, so a supplier's exact price is
+ * never written to the chain, read by the buyer, or seen by rival
+ * suppliers.
+ *
+ * ── What `budget_max` and `price` actually are ──────────────────────────
+ *
+ * This contract does not move, hold, or settle any currency, token, or
+ * native Midnight balance. `budget_max` and `price` are plain Uint<64>
+ * numbers; the contract only ever compares them ("is price <= budget?",
+ * "is the new price < the previous price?"). There is no escrow, no
+ * payment, and no settlement on-chain — that happens off-chain, between
+ * the buyer and whichever qualifying supplier they choose (see
+ * PROPOSAL.md, "Mainnet Feasibility").
+ *
+ * Since those numbers carry no inherent unit, the buyer also publishes a
+ * short `unit_label` (e.g. "USD", "USDC", "tDUST") when opening the RFQ,
+ * purely so every participant reading the same numbers agrees what they
+ * mean. This label is informational, not cryptographic — nothing in the
+ * contract enforces that a submitted price is denominated in whatever the
+ * label says. A supplier trusts the buyer's stated unit the same way
+ * they'd trust it written in an RFQ email; the label is on-chain only so
+ * every party — buyer and every supplier, not just whoever set it —
+ * reads the identical text, rather than each guessing independently.
+ * `title` (what the budget is actually for) is the same kind of field:
+ * display-only text, not something the contract interprets or checks.
  *
  * ── Midnight's dual ledger, as used here ────────────────────────────────
  *
  * PUBLIC LEDGER (on-chain, visible to anyone):
+ *   - buyer_key: the coin public key of whoever opened this RFQ. Used to
+ *     restrict `close_rfq` to the buyer and to block the buyer from
+ *     bidding on their own RFQ — see "On-chain identity checks" below for
+ *     the honest limits of that guarantee. Publishing it is not a new
+ *     leak: the same key is already visible as the sender of the
+ *     `open_rfq` transaction to anyone reading the chain.
+ *   - title: what the budget is for, e.g. "500 units of powder-coated
+ *     steel brackets". Display-only, like unit_label.
  *   - budget_max: the buyer's disclosed ceiling price. Buyers publish this
  *     deliberately — it is what attracts competitive bids in the first
  *     place, the same way a real RFQ states a budget range.
+ *   - unit_label: what budget_max and every submitted price are stated to
+ *     be denominated in. Display-only; see above.
+ *   - is_initialized: whether open_rfq has ever been called on this
+ *     contract. Separate from is_open so a buyer cannot call open_rfq a
+ *     second time to silently change the budget after bids exist.
  *   - bid_count: total number of sealed bids submitted.
  *   - qualifying_count: how many of those bids were at or under budget.
  *   - revision_count: how many bids were verified price improvements on
@@ -22,7 +58,9 @@
  *   - last_bid: the price this supplier most recently bid on this RFQ.
  *     Persisted locally between transactions via the `remember_bid`
  *     witness and read back via `local_last_bid`. It is never written to
- *     the public ledger and never leaves the supplier's machine.
+ *     the public ledger and never leaves the supplier's machine. Also
+ *     doubles as this contract's "have I already bid" flag — see
+ *     submit_bid.
  *
  * PRIVATE CIRCUIT INPUT (transient, never stored anywhere):
  *   - price: the exact bid being submitted right now. Consumed inside the
@@ -43,6 +81,31 @@
  * ever learns either number. The public ledger records only that a
  * verified improvement happened.
  *
+ * ── On-chain identity checks (buyer key, one-bid-then-revise) ───────────
+ *   `ownPublicKey()` returns the calling key inside a circuit. Two things
+ *   depend on it here: `submit_bid` rejects the buyer bidding on their own
+ *   RFQ, and `close_rfq` rejects anyone except the buyer closing it.
+ *
+ *   Be precise about what this does and doesn't guarantee. `ownPublicKey()`
+ *   is a value the prover supplies when building their own proof — it is
+ *   not checked against a wallet signature at the protocol level. Every
+ *   normal user going through this dApp's UI is genuinely blocked: the
+ *   connected wallet's key is what gets used, and there's no exposed way
+ *   to override it. Someone willing to write custom client code that lies
+ *   about its own `ownPublicKey()` during proof generation is not stopped
+ *   by this alone — that would need a signature-based scheme, which is
+ *   future work (see PROPOSAL.md). This is the same class of guarantee as
+ *   the `local_last_bid() == 0` check below: real for the app as shipped,
+ *   not adversarially airtight against a hostile client.
+ *
+ *   Similarly, "one bid, then only revise" is enforced by
+ *   `local_last_bid() == 0` in submit_bid, backed by private state that
+ *   lives in this browser's localStorage. A supplier who clears their own
+ *   browser storage looks "fresh" to the contract again. That's a
+ *   client-side reset of a client-side memory, not a contract bug, but
+ *   it's honest to say the rule holds only as long as a supplier doesn't
+ *   deliberately wipe their own state to get around it.
+ *
  * ── Why the winning price isn't settled on-chain here ───────────────────
  *   Trustlessly picking "the lowest of N sealed bids" on-chain requires
  *   comparing every bid against every other bid without ever revealing
@@ -60,11 +123,24 @@ pragma language_version >= 0.23;
 import CompactStandardLibrary;
 
 // ── Public ledger state ──────────────────────────────────────────────────────
+export ledger buyer_key: ZswapCoinPublicKey;
+// Display-only: what the budget is for, e.g. "office chairs, 40 units".
+// Fixed at 32 bytes; the JS caller encodes/decodes UTF-8 and pads/truncates.
+export ledger title: Bytes<32>;
 export ledger budget_max: Uint<64>;
+// Display-only unit label for budget_max/price, e.g. "USD" or "tDUST" —
+// see the file header ("What budget_max and price actually are"). Fixed at
+// 16 bytes; the JS caller encodes/decodes the UTF-8 text and pads or
+// truncates to fit.
+export ledger unit_label: Bytes<16>;
+// Set once, by the first (and only) successful open_rfq call. Distinct from
+// is_open so a buyer cannot reopen and silently redefine the budget/title
+// after bids already exist against the original terms.
+export ledger is_initialized: Boolean;
+export ledger is_open: Boolean;
 export ledger bid_count: Counter;
 export ledger qualifying_count: Counter;
 export ledger revision_count: Counter;
-export ledger is_open: Boolean;
 
 // ── Private state access (witnesses) ─────────────────────────────────────────
 // Implemented in TypeScript (src/api/privateState.ts) against a private state
@@ -74,14 +150,21 @@ witness local_last_bid(): Uint<64>;
 witness remember_bid(price: Uint<64>): [];
 
 // ── Circuit: open_rfq ──────────────────────────────────────────────────────────
-// The buyer sets the public budget ceiling and opens bidding. budget_max is
-// disclosed deliberately: it's the number that draws bids, not something the
-// buyer is trying to hide. Uses disclose() because assigning a circuit
-// parameter into public state always requires it, even for a value that was
-// never private to begin with.
-export circuit open_rfq(budget: Uint<64>): [] {
+// The buyer sets the title, budget ceiling, and unit, and opens bidding.
+// Guarded by is_initialized so this can only ever run once per contract —
+// without that guard, a buyer could call open_rfq again mid-auction and
+// change the budget under suppliers who already bid against the original
+// number. ownPublicKey() is captured here as buyer_key so submit_bid and
+// close_rfq can check against it later; see the file header for what that
+// check does and doesn't guarantee.
+export circuit open_rfq(rfq_title: Bytes<32>, budget: Uint<64>, unit: Bytes<16>): [] {
+  assert(!is_initialized, "this RFQ has already been opened and cannot be reopened");
   assert(budget > 0, "budget must be positive");
+  buyer_key = disclose(ownPublicKey());
+  title = disclose(rfq_title);
   budget_max = disclose(budget);
+  unit_label = disclose(unit);
+  is_initialized = disclose(true);
   is_open = disclose(true);
 }
 
@@ -94,11 +177,20 @@ export circuit open_rfq(budget: Uint<64>): [] {
 // The price itself is never assigned to public state anywhere in this
 // circuit, so it never becomes disclosable.
 //
+// Two guards beyond the original design:
+//   - ownPublicKey() != buyer_key stops the buyer bidding on their own RFQ.
+//   - local_last_bid() == 0 stops a supplier calling submit_bid a second
+//     time to bypass submit_revised_bid's "strictly lower" rule — every
+//     bid after a supplier's first on this RFQ must go through the
+//     revision circuit, which can only move the price down.
+//
 // remember_bid stores the price in the supplier's own private state so a
 // later submit_revised_bid can prove an improvement against it. That write
 // is local: it does not touch the transaction or the public ledger.
 export circuit submit_bid(price: Uint<64>): [] {
   assert(is_open, "RFQ is not open for bids");
+  assert(ownPublicKey() != buyer_key, "the buyer cannot bid on their own RFQ");
+  assert(local_last_bid() == 0, "you already have a bid on this RFQ — use submit_revised_bid to lower it");
   assert(price > 0, "price must be positive");
 
   const qualifies: Uint<8> = price <= budget_max ? 1 : 0;
@@ -118,6 +210,11 @@ export circuit submit_bid(price: Uint<64>): [] {
 // values that neither the buyer nor the chain ever sees. What lands publicly
 // is one increment of revision_count: "a verified price improvement
 // happened", with no indication of the magnitude or either endpoint.
+//
+// No separate "not the buyer" check is needed here: reaching this circuit
+// requires local_last_bid() > 0, and submit_bid is the only way to set that,
+// and submit_bid itself already refuses the buyer. A buyer can never have a
+// nonzero last_bid to revise from.
 export circuit submit_revised_bid(price: Uint<64>): [] {
   assert(is_open, "RFQ is not open for bids");
   assert(price > 0, "price must be positive");
@@ -135,9 +232,12 @@ export circuit submit_revised_bid(price: Uint<64>): [] {
 }
 
 // ── Circuit: close_rfq ──────────────────────────────────────────────────────────
-// Stops further bids. No private input — this only flips a public flag that
-// was already public.
+// Stops further bids. Restricted to the buyer — previously anyone could
+// close anyone else's RFQ, which would let a losing supplier grief the
+// auction shut before a better bid could land. See the file header for
+// what the ownPublicKey() check does and doesn't guarantee.
 export circuit close_rfq(): [] {
+  assert(ownPublicKey() == buyer_key, "only the buyer who opened this RFQ may close it");
   assert(is_open, "RFQ is already closed");
   is_open = disclose(false);
 }
