@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "compile": "compact compile contracts/sealedquote.compact managed/sealedquote",
-    "copy-assets": "mkdir -p public/managed/sealedquote/keys public/managed/sealedquote/zkir && cp managed/sealedquote/keys/* public/managed/sealedquote/keys/ && cp managed/sealedquote/zkir/* public/managed/sealedquote/zkir/ && cp managed/sealedquote/contract/index.js src/contract/sealedquote.js && cp managed/sealedquote/contract/index.d.ts src/contract/sealedquote.d.ts",
+    "copy-assets": "mkdir -p public/managed/sealedquote/keys public/managed/sealedquote/zkir && cp managed/sealedquote/keys/* public/managed/sealedquote/keys/ && cp managed/sealedquote/zkir/* public/managed/sealedquote/zkir/ && sed '/\\/\\/# sourceMappingURL=/d' managed/sealedquote/contract/index.js > src/contract/sealedquote.js && cp managed/sealedquote/contract/index.d.ts src/contract/sealedquote.d.ts",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
